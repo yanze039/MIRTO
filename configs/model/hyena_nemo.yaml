@@ -1,0 +1,35 @@
+name: tiny-hyena
+type: hyena
+pad_vocab_size_multiple: 8
+protein_hidden_size: 960
+hyena_config:
+  hybrid_override_pattern: "SDH*SDHSDH*"
+  num_layers: 11
+  seq_length: 8192
+  hidden_size: 512
+  num_groups_hyena: 512
+  num_groups_hyena_medium: 32  # 64
+  num_groups_hyena_short: 32  # 64
+  make_vocab_size_divisible_by: 8
+  tokenizer_library: 'byte-level'
+  mapping_type: "base"
+  ffn_hidden_size: 1536
+  gated_linear_unit: True
+  num_attention_heads: 8
+  use_cpu_initialization: False
+  hidden_dropout: 0.0
+  attention_dropout: 0.0
+  params_dtype: torch.bfloat16
+  normalization: "RMSNorm"
+  add_qkv_bias: False
+  add_bias_linear: False
+  layernorm_epsilon: 1e-6
+  recompute_granularity: 'full'
+  recompute_method: 'uniform'
+  recompute_num_layers: 1  # needs to be a multiple of num_layers
+  hyena_init_method: 'small_init'
+  hyena_output_layer_init_method: 'wang_init'
+  hyena_filter_no_wd: True
+  remove_activation_post_first_layer: False
+  add_attn_proj_bias: False
+  use_short_conv_bias: True

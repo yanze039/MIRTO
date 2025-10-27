@@ -1,0 +1,20 @@
+name: tiny-mamba
+type: dimamba2
+d_model: 512
+n_layer: 24
+d_intermediate: 0
+attn_layer_idx: null
+attn_cfg: null
+rms_norm: True
+residual_in_fp32: True
+fused_add_norm: True
+pad_vocab_size_multiple: 1
+protein_hidden_size: 960
+# (hidden_size * expand) = (num_heads * head_dim):
+ssm_cfg:
+  d_state: 128
+  d_conv: 4
+  expand: 2
+  headdim: 64
+  ngroups: 1
+

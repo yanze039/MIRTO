@@ -1,0 +1,26 @@
+name: tiny-mamba
+type: dimamba2
+d_model: 512
+n_layer: 24
+d_intermediate: 1344
+attn_layer_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+attn_cfg: 
+  num_heads: 8
+  causal: True
+  qkv_proj_bias: False
+  out_proj_bias: False
+  use_flash_attn: True
+  use_alibi: True
+rms_norm: True
+residual_in_fp32: True
+fused_add_norm: True
+pad_vocab_size_multiple: 8
+protein_hidden_size: 960
+# (hidden_size * expand) = (num_heads * head_dim):
+ssm_cfg:
+  d_state: 128
+  d_conv: 4
+  expand: 2
+  headdim: 64
+  ngroups: 1
+

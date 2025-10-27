@@ -1,0 +1,62 @@
+defaults:
+  - _self_
+  - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, progress_bar]
+  - /data: joint_sequence
+  - /model: mamba
+  - /strategy: ddp
+  - /lr_scheduler: constant_warmup
+
+mode: train  # train / ppl_eval / sample_eval
+backbone: mamba2 
+seed: 42
+
+training:
+  finetune_from: null
+
+optim:
+  weight_decay: 0.01
+  lr: 0.0004
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  min_learning_rate: 0.00003
+  num_warmup_steps: 5000
+
+trainer:
+  _target_: lightning.Trainer
+  accelerator: "auto"
+  num_nodes: 1
+  # devices: ${device_count:}
+  devices: 2
+  # accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.5
+  precision: 'bf16-mixed'
+  num_sanity_val_steps: 2
+  # max_steps: 1_000_000
+  max_epochs: 1000
+  log_every_n_steps: 10
+  limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
+  limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
+  use_distributed_sampler: false
+  val_check_interval: 0.2
+  enable_checkpointing: true
+  enable_progress_bar: true
+
+tensorboard:
+  log_dir: ${cwd:}/tensorboard/${data.name}/${now:%Y.%m.%d}/${now:%H%M%S}
+  name: $${now:%Y.%m.%d-%H%M%S}
+  version: ${.name}_${seed}
+
+hydra:
+  run:
+    dir: ../outputs/${data.name}/${model.name}/${now:%Y.%m.%d}/${now:%H%M%S}
+  job:
+    chdir: true
+
+checkpointing:
+  # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
+  save_dir: ${cwd:}
+  # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
+  resume_from_ckpt: false
+  resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

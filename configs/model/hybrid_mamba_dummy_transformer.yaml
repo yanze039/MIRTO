@@ -1,0 +1,20 @@
+name: tiny-mamba
+type: dimamba2
+d_model: 256
+n_layer: 4
+d_intermediate: 672
+attn_layer_idx: [0, 1, 2, 3]
+attn_cfg: 
+  num_heads: 4
+  causal: True
+  qkv_proj_bias: False
+  out_proj_bias: False
+  use_flash_attn: True
+  use_alibi: True
+rms_norm: True
+residual_in_fp32: True
+fused_add_norm: True
+pad_vocab_size_multiple: 8
+protein_hidden_size: 960
+ssm_cfg: null
+
