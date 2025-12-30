@@ -1,4 +1,0 @@
-progress_bar:
-  _target_: training_utils.LitProgressBar
-  refresh_rate: 20
-  leave: true

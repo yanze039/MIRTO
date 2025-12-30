@@ -1,6 +1,6 @@
-name: joint_sequence
+name: species_specific
 datamodule:
-  _target_: data.joint_sequence.JointSequenceDataModule
+  _target_: jsm.data.species_specific.SpeciesSpecificJointSequenceDataModule
   num_workers: 4
   lmdb_path: /home/yanze039/orcd/scratch/data/data/RefSeq/valid_sequence_pair.lmdb
   # key_list_file: "/nobackup1/yanze039/data/RefSeq/valid_sequence_pair.keys.less_than_8000.msgpack.zst"
@@ -8,6 +8,7 @@ datamodule:
   validation_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq/remove_homology_protein/revised_valid_keys.msgpack.zst
   test_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq/remove_homology_protein/revised_test_keys.msgpack.zst
   sequence_length_file: /home/yanze039/orcd/scratch/data/data/RefSeq/valid_sequence_pair.lengths.msgpack.zst
+  metadata_path: /home/yanze039/orcd/scratch/data/data/RefSeq/all_metadata.msgpack.zst
   batch_size: null
   # validation_split: 0.0005
   tokens_per_batch: null

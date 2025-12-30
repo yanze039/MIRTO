@@ -1,0 +1,17 @@
+name: species_specific
+datamodule:
+  _target_: jsm.data.species_specific.SpeciesSpecificJointSequenceDataModule
+  num_workers: 4
+  metadata_path: /home/yanze039/orcd/scratch/data/data/RefSeq/all_metadata.msgpack.zst
+  batch_size: null
+  tokens_per_batch: null
+  work_dir: /home/yanze039/orcd/scratch/data/data/RefSeq/training
+  overwrite: false
+  random_validation: null
+
+  lmdb_path: /home/yanze039/orcd/scratch/data/data/RefSeq_debug/dummy_valid_sequence_pair.lmdb
+  training_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq_debug/dummy_revised_train_keys.msgpack.zst
+  validation_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq_debug/dummy_revised_validation_keys.msgpack.zst
+  test_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq_debug/dummy_revised_validation_keys.msgpack.zst
+  sequence_length_file: /home/yanze039/orcd/scratch/data/data/RefSeq_debug/dummy_valid_sequence_pair.lengths.msgpack.zst
+

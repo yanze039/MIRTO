@@ -405,14 +405,13 @@ class MixerModel(nn.Module):
         return output_attention_weights
 
 
-class JointSequenceMambaModel(nn.Module):
+class CellTypeSpecificJointSequenceAttentionModel(nn.Module):
 
     def __init__(
         self,
         config,
         rna_vocab_size,
         protein_vocab_size,
-        num_modalities=5,
         initializer_cfg=None,
         device=None,
         dtype=None,
@@ -456,6 +455,8 @@ class JointSequenceMambaModel(nn.Module):
         self.rna_lm_head = nn.Linear(d_model, self.rna_vocab_size, bias=True)
         self.protein_align_head = nn.Linear(config.protein_hidden_size, config.d_model, bias=True)
         self.protein_embedding_norm = RMSNorm(config.protein_hidden_size, eps=1e-6)
+        
+        self.cell_type_embedding = nn.Embedding(config.num_cell_types, d_model)
 
         # Initialize weights and apply final processing
         self.apply(
@@ -476,23 +477,26 @@ class JointSequenceMambaModel(nn.Module):
     def set_precision_for_alibi_slopes(self, dtype):
         self.backbone.set_precision_for_alibi_slopes(dtype)
 
-    def forward(self, 
-                input_ids,                 
-                protein_embeddings,
-                row_wise_col_perms,
-                inverse_row_wise_col_perms,
-                attention_mask,
-                seq_idx=None,
-                inference_params=None, 
-                **mixer_kwargs,
+    def forward(
+            self, 
+            input_ids,
+            cell_type_ids,                 
+            protein_embeddings,
+            row_wise_col_perms,
+            inverse_row_wise_col_perms,
+            attention_mask,
+            seq_idx=None,
+            inference_params=None, 
+            **mixer_kwargs,
         ):
-        
         B, Lr = input_ids.shape
         Lp = protein_embeddings.shape[1]
-        L = Lr + Lp
+        Lct = cell_type_ids.shape[1]
+        L = Lr + Lp + Lct
         inputs_embeds = self.rna_embeddings(input_ids)
+        cell_type_embeds = self.cell_type_embedding(cell_type_ids)
         protein_embeddings = self.protein_align_head(self.protein_embedding_norm(protein_embeddings))
-        inputs_embeds = torch.cat([protein_embeddings, inputs_embeds], dim=1)
+        inputs_embeds = torch.cat([cell_type_embeds, protein_embeddings, inputs_embeds], dim=1)
         inputs_embeds = torch.gather(inputs_embeds, dim=1, index=row_wise_col_perms.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))  
         inputs_embeds = inputs_embeds * attention_mask.unsqueeze(-1)
         
@@ -506,7 +510,7 @@ class JointSequenceMambaModel(nn.Module):
         )
         hidden_states = pad_input(outputs.squeeze(0), indices, B, L)
         hidden_states = hidden_states * attention_mask.unsqueeze(-1)
-        hidden_states = torch.gather(hidden_states, dim=1, index=inverse_row_wise_col_perms.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))[:,Lp:,:]
+        hidden_states = torch.gather(hidden_states, dim=1, index=inverse_row_wise_col_perms.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))[:,Lct+Lp:,:]
         rna_logits = self.rna_lm_head(hidden_states)
         return rna_logits, None, None
         # return rna_logits, codon_protein_translation_logits, modality_logits
@@ -550,12 +554,11 @@ class JointSequenceMambaModel(nn.Module):
             self,
             input_ids,                 
             protein_embeddings=None,
+            cell_type_input_ids=None,
             return_hidden_states=True,
             inference_params=None, 
             num_last_tokens=0,
-            hidden_layer_idx=None,
-            *mixer_args,
-            **mixer_kwargs,
+            hidden_layer_idx=None
         ):
         B, Lr = input_ids.shape
         inputs_embeds = self.rna_embeddings(input_ids)  
@@ -564,6 +567,9 @@ class JointSequenceMambaModel(nn.Module):
             # print(protein_embeddings.shape)
             # print(inputs_embeds.shape)
             inputs_embeds = torch.cat([protein_embeddings, inputs_embeds], dim=1)
+        if cell_type_input_ids is not None:
+            cell_type_embeds = self.cell_type_embedding(cell_type_input_ids)
+            inputs_embeds = torch.cat([cell_type_embeds, inputs_embeds], dim=1)
         
         outputs = self.backbone(
             hidden_states=inputs_embeds,
@@ -577,29 +583,6 @@ class JointSequenceMambaModel(nn.Module):
             outputs = outputs[:, -num_last_tokens:, :]
         rna_logits = self.rna_lm_head(outputs)
         return rna_logits
-        
-        # B, Lr = input_ids.shape
-        # Lp = protein_embeddings.shape[1]
-        # L = Lr + Lp
-        # inputs_embeds = self.rna_embeddings(input_ids)
-        # protein_embeddings = self.protein_align_head(self.protein_embedding_norm(protein_embeddings))
-        # inputs_embeds = torch.cat([protein_embeddings, inputs_embeds], dim=1)
-        # inputs_embeds = torch.gather(inputs_embeds, dim=1, index=row_wise_col_perms.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))  
-        # inputs_embeds = inputs_embeds * attention_mask.unsqueeze(-1)
-        
-        # indices, cu_seqlens, max_seqlen = get_unpad_data(attention_mask)
-        # inputs_embeds = index_first_axis(rearrange(inputs_embeds, "b s ... -> (b s) ..."), indices).unsqueeze(0)
-        # outputs = self.backbone(
-        #     hidden_states=inputs_embeds,
-        #     cu_seqlens=cu_seqlens,
-        #     max_seqlen=max_seqlen,
-        #     seq_idx=seq_idx,
-        # )
-        # hidden_states = pad_input(outputs.squeeze(0), indices, B, L)
-        # hidden_states = hidden_states * attention_mask.unsqueeze(-1)
-        # hidden_states = torch.gather(hidden_states, dim=1, index=inverse_row_wise_col_perms.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))[:,Lp:,:]
-        # rna_logits = self.rna_lm_head(hidden_states)
-        # return rna_logits, None, None
     
     def calculate_attention_weights(
             self, 

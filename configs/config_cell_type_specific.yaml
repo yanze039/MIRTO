@@ -1,25 +1,26 @@
 defaults:
   - _self_
   - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, progress_bar]
-  - /data: joint_sequence
-  - /model: mamba
+  - /data: cell_type_specific
+  - /model: attention_cell
   - /strategy: ddp
   - /lr_scheduler: constant_warmup
 
-mode: train  # train / ppl_eval / sample_eval
-backbone: mamba2 
+backbone: attention_cell 
 seed: 42
+utr_only: false
+cell_type_finetune: true
 
 training:
   finetune_from: null
 
 optim:
   weight_decay: 0.01
-  lr: 0.0004
+  lr: 0.0001
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
-  min_learning_rate: 0.00003
+  min_learning_rate: 0.00001
   num_warmup_steps: 5000
 
 trainer:
@@ -30,8 +31,9 @@ trainer:
   devices: 2
   # accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   accumulate_grad_batches: 1
-  gradient_clip_val: 0.5
-  precision: 'bf16-mixed'
+  gradient_clip_val: 1.0
+  # precision: "transformer-engine"  # bf16-mixed / 16-mixed / 32 / "transformer-engine"
+  precision: 'bf16-mixed'  # bf16-mixed / 16-mixed / 32
   num_sanity_val_steps: 2
   # max_steps: 1_000_000
   max_epochs: 1000
@@ -50,7 +52,7 @@ tensorboard:
 
 hydra:
   run:
-    dir: ../outputs/${data.name}/${model.name}/${now:%Y.%m.%d}/${now:%H%M%S}
+    dir: ${hydra:runtime.cwd}
   job:
     chdir: true
 

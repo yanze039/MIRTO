@@ -1,0 +1,14 @@
+name: joint_sequence_human_specific
+datamodule:
+  _target_: jsm.data.joint_sequence.JointSequenceDataModule
+  num_workers: 4
+  lmdb_path: /home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/data/human_valid_sequence_pair.lmdb
+  training_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/data/protein_homologs/human_training_keys_le8000_id_0.7.msgpack.zst
+  validation_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/data/protein_homologs/human_validation_keys_le8000_id_0.7.msgpack.zst
+  test_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/data/protein_homologs/human_test_keys_le8000_id_0.7.msgpack.zst
+  sequence_length_file: /home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/data/human_valid_sequence_pair.lengths.msgpack.zst
+  batch_size: null
+  tokens_per_batch: null
+  work_dir: /home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/training
+  overwrite: false
+  random_validation: null

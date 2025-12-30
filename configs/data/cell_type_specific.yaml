@@ -1,0 +1,15 @@
+name: cell_type_specific
+datamodule:
+  _target_: jsm.data.cell_type_specific_jsm.CellTypeSpecificJointSequenceDataModule
+  num_workers: 4
+  lmdb_path: /home/yanze039/orcd/scratch/data/data/cell_embedding/data/cell_type_valid_sequence_pair.lmdb
+  training_key_list_file: /home/yanze039/orcd/scratch/data/data/cell_embedding/data/train_cell_type_sequence_id_pair.msgpack.zst
+  validation_key_list_file: /home/yanze039/orcd/scratch/data/data/cell_embedding/data/valid_cell_type_sequence_id_pair.msgpack.zst
+  test_key_list_file: /home/yanze039/orcd/scratch/data/data/cell_embedding/data/test_cell_type_sequence_id_pair.msgpack.zst
+  sequence_length_file: /home/yanze039/orcd/scratch/data/data/cell_embedding/data/cell_type_valid_sequence_pair.lengths.msgpack.zst
+  batch_size: null
+  # validation_split: 0.0005
+  tokens_per_batch: null
+  work_dir: /home/yanze039/orcd/scratch/data/data/cell_embedding/data/training
+  overwrite: false
+  random_validation: null

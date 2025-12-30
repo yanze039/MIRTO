@@ -21,7 +21,7 @@ modality_map = {
             "utr_5":  0,
             "cds":    1,
             "utr_3":  2,
-            "others": 3,
+            "global_special_tokens": 3,
             "padding": 4,
         }
 
@@ -498,6 +498,9 @@ class DistributedSequenceBucketBatchSampler(DistributedSampler):
         )
         self.epoch = state_dict["epoch"]
         self.seed = state_dict["seed"]
+        print(f"Sampler reinitialized to epoch {self.epoch}, "
+              f"current_batch_idx {self.current_batch_idx}, "
+              f"seed {self.seed}")
 
     def __iter__(self):
         indices = list(range(self.total_batches))
@@ -522,16 +525,10 @@ class DistributedSequenceBucketBatchSampler(DistributedSampler):
 
         # Split batches across GPUs
         indices = indices[self.rank:self.total_size:self.num_replicas]
-        # return iter([self.batch_indices[i] for i in indices])
-        # for i in indices:
-        #     if i < self.current_batch_idx:
-        #         # Skip already yielded batches
-        #         continue
-        #     self.current_batch_idx = i
-        #     yield self.batch_indices[i]
         for i in indices[self.current_batch_idx:]:
-            # print("self.current_batch_idx", self.current_batch_idx)
             self.current_batch_idx += 1
+            if self.current_batch_idx > len(indices):
+                raise RuntimeError("Reached the end of the sampler for this epoch.")
             yield self.batch_indices[i]
         
 
@@ -680,13 +677,25 @@ class DecodingController:
         mask = self.stage_token_mask[self.status].clone()
         protein_mask = torch.zeros_like(mask, dtype=torch.bool)
         is_within_cds = (self.status == self.decoding_stage_table["CDS"])
+        aa_list = []
         for i, protein_sequence in enumerate(self.protein_sequences):
             if is_within_cds[i]:
                 aa = protein_sequence[self.decoding_aa_positions[i]]
+                aa_list.append(aa)
                 if aa in aminoacid_to_codon:
                     valid_tokens = self.get_valid_token_idx("aa_" + aa)
                     if valid_tokens is not None:
                         protein_mask[i, valid_tokens] = True
+                else:
+                    if aa.upper() == 'U':
+                        valid_tokens_C = self.get_valid_token_idx("aa_C")
+                        valid_tokens_S = self.get_valid_token_idx("aa_*")
+                        if valid_tokens_C is not None:
+                            protein_mask[i, valid_tokens_C] = True
+                        if valid_tokens_S is not None:
+                            protein_mask[i, valid_tokens_S] = True
+                    else:
+                        raise RuntimeError(f"Unknown aminoacid {aa} in protein sequence.")
         mask = torch.where(
             is_within_cds.view(-1, 1),
             protein_mask,

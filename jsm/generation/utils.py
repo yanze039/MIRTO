@@ -105,9 +105,13 @@ def sample(logits, top_k=1, top_p=0.0, min_p=0.0, temperature=1.0):
             if temperature != 1.0:
                 logits_top /= temperature
             modify_logits_for_top_p_filtering(logits_top, top_p)
+            softmaxed = torch.softmax(logits_top, dim=-1)
+            if softmaxed.isnan().any().item():
+                print("got nan in softmaxed!")
+                return None
             return indices[
                 torch.arange(indices.shape[0], device=indices.device),
-                torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(dim=-1),
+                torch.multinomial(softmaxed, num_samples=1).squeeze(dim=-1),
             ]
         else:
             if min_p > 0.0:
@@ -121,6 +125,7 @@ def sample(logits, top_k=1, top_p=0.0, min_p=0.0, temperature=1.0):
             # Clone so that when we modify for top_p we don't change the original logits
             logits_top = logits / temperature if temperature != 1.0 else logits.clone()
             modify_logits_for_top_p_filtering(logits_top, top_p)
-            return torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(
+            softmaxed = torch.softmax(logits_top, dim=-1)
+            return torch.multinomial(softmaxed, num_samples=1).squeeze(
                 dim=-1
             )

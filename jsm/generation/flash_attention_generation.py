@@ -28,6 +28,7 @@ def decode(
     cg=False,
     enable_timing=False,
     protein_embeddings=None,
+    species_ids=None,
     protein_sequences=None,
     progress_bar=True,
     cuda_monitor=False,
@@ -73,6 +74,7 @@ def decode(
             logits = model.generating_forward(
                 input_ids,
                 protein_embeddings=protein_embeddings,
+                species_ids=species_ids,
                 return_hidden_states=False,
                 inference_params=inference_params,
                 num_last_tokens=1,
@@ -95,7 +97,7 @@ def decode(
     def sample_tokens(logits, inference_params):
         token = sample(logits, top_k=top_k, top_p=top_p, min_p=min_p, temperature=temperature)
         # return rearrange(token, "b -> b 1")
-        return token.unsqueeze(1)
+        return token.unsqueeze(1) if token is not None else None
 
     start = torch.cuda.Event(enable_timing=enable_timing)
     end = torch.cuda.Event(enable_timing=enable_timing)
@@ -128,10 +130,13 @@ def decode(
     while not controller.should_stop():
         logits = get_logits(controller.sequences[-1], inference_params)
         inference_params.seqlen_offset += controller.sequences[-1].shape[1]
-        logits = controller.modify_logits(logits)
-        sampled_tokens = sample_tokens(logits, inference_params)
+        modified_logits = controller.modify_logits(logits)
+        sampled_tokens = sample_tokens(modified_logits, inference_params)
+        if sampled_tokens is None:
+            raise RuntimeError("sampled_tokens is None, likely due to NaNs in logits after filtering.")
+        # print(f"Sampled tokens: {sampled_tokens.squeeze(1)}")
         controller.update(sampled_tokens)
-        metrics.update(logits, sampled_tokens.squeeze(1))
+        metrics.update(modified_logits, sampled_tokens.squeeze(1))
         pbar.update(controller.sequences[-1].shape[1]) if pbar is not None else None
     if enable_timing:
         end.record()
