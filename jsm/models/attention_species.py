@@ -362,14 +362,25 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, hidden_states, inference_params=None, hidden_layer_idx=None, **mixer_kwargs):
+    def forward(
+            self, 
+            hidden_states, 
+            inference_params=None, 
+            hidden_layer_idx=None,
+            return_middle_hidden_states=False,
+            **mixer_kwargs
+        ):
         residual = None
+        mid_layer_idx = len(self.layers) // 2
+        middle_hidden_states = None
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
             if hidden_layer_idx is not None and layer.layer_idx == hidden_layer_idx:
                 return hidden_states + residual if residual is not None else hidden_states
+            if return_middle_hidden_states and layer.layer_idx == mid_layer_idx:
+                middle_hidden_states = hidden_states + residual if residual is not None else hidden_states
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -385,6 +396,8 @@ class MixerModel(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 is_rms_norm=isinstance(self.norm_f, RMSNorm)
             )
+        if return_middle_hidden_states:
+            return hidden_states, middle_hidden_states
         return hidden_states
     
     def calculate_attention_weights(self, 
@@ -490,6 +503,7 @@ class SpeciesSpecificJointSequenceAttentionModel(nn.Module):
             modality_mask=None,
             seq_idx=None,
             inference_params=None, 
+            return_middle_hidden_states=False,
             **mixer_kwargs,
         ):
         B, Lr = input_ids.shape
@@ -501,7 +515,6 @@ class SpeciesSpecificJointSequenceAttentionModel(nn.Module):
         # if modality_type_ids is not None:
         modality_embeds = self.modality_embedding(modality_type_ids) * modality_mask.unsqueeze(-1)
         inputs_embeds = inputs_embeds + modality_embeds
-        
         
         species_embeds = self.species_embedding(species_ids)
         protein_embeddings = self.protein_align_head(self.protein_embedding_norm(protein_embeddings))
@@ -516,12 +529,24 @@ class SpeciesSpecificJointSequenceAttentionModel(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             seq_idx=seq_idx,
+            return_middle_hidden_states=return_middle_hidden_states,
         )
-        hidden_states = pad_input(outputs.squeeze(0), indices, B, L)
+        if return_middle_hidden_states:
+            hidden_states, middle_hidden_states = outputs
+        else:
+            hidden_states = outputs
+            middle_hidden_states = None
+        
+        hidden_states = pad_input(hidden_states.squeeze(0), indices, B, L)
         hidden_states = hidden_states * attention_mask.unsqueeze(-1)
         hidden_states = torch.gather(hidden_states, dim=1, index=inverse_row_wise_col_perms.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))[:,Lct+Lp:,:]
         rna_logits = self.rna_lm_head(hidden_states)
         
+        if return_middle_hidden_states:
+            middle_hidden_states = pad_input(middle_hidden_states.squeeze(0), indices, B, L)
+            middle_hidden_states = middle_hidden_states * attention_mask.unsqueeze(-1)
+            middle_hidden_states = torch.gather(middle_hidden_states, dim=1, index=inverse_row_wise_col_perms.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]))[:,Lct+Lp:,:]
+            return rna_logits, middle_hidden_states
         return rna_logits
 
 

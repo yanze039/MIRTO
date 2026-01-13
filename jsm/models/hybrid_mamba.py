@@ -564,7 +564,7 @@ class JointSequenceMambaModel(nn.Module):
             # print(protein_embeddings.shape)
             # print(inputs_embeds.shape)
             inputs_embeds = torch.cat([protein_embeddings, inputs_embeds], dim=1)
-        
+
         outputs = self.backbone(
             hidden_states=inputs_embeds,
             inference_params=inference_params,

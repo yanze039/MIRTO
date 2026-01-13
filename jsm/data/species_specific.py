@@ -256,6 +256,108 @@ def generate_random_sequence(sequence_length):
     return nas
 
 
+import numpy as np
+
+BASE_ORDER = ["A", "C", "G", "U"]
+BASE_TO_ID = {b: i for i, b in enumerate(BASE_ORDER)}
+BASE_MAP = np.full(256, -1, dtype=np.int16)
+BASE_MAP[ord('A')] = 0
+BASE_MAP[ord('C')] = 1
+BASE_MAP[ord('G')] = 2
+BASE_MAP[ord('U')] = 3
+BASE_MAP[ord('T')] = 3  # if your sequences sometimes use T
+
+def kmer_counts_from_text(seq: str, k: int, counts: np.ndarray, mask: np.ndarray | None = None):
+    """
+    Update `counts` (shape [4**k]) in place with k-mer counts from `seq`.
+    - seq: raw string of A/C/G/U (T allowed -> treated as U)
+    - mask: optional bool array of shape [len(seq)], True = include this position.
+            A window is counted only if ALL k positions are True and valid bases.
+    """
+    s = seq.upper().encode("ascii", "ignore")
+    x = BASE_MAP[np.frombuffer(s, dtype=np.uint8)]  # [-1,0,1,2,3], shape [L]
+    L = x.shape[0]
+    T = L - k + 1
+    if T <= 0:
+        return
+
+    valid = (x >= 0)
+    if mask is not None:
+        # mask could exclude separators / special region boundaries etc.
+        valid = valid & mask.astype(bool)
+
+    # window valid if all k positions valid
+    # compute via convolution-like sliding AND (vectorized)
+    # (small k, so this is fine)
+    win_ok = valid[:T].copy()
+    for i in range(1, k):
+        win_ok &= valid[i:i+T]
+
+    if not win_ok.any():
+        return
+
+    # rolling base-4 code: code[t] = sum_{i=0..k-1} x[t+i] * 4^(k-1-i)
+    weights = (4 ** np.arange(k-1, -1, -1, dtype=np.int64))  # [k]
+    # build codes vectorized using dot over a strided view
+    # shape: [T, k]
+    Xw = np.lib.stride_tricks.as_strided(
+        x,
+        shape=(T, k),
+        strides=(x.strides[0], x.strides[0]),
+        writeable=False
+    ).astype(np.int64)
+
+    codes = (Xw * weights).sum(axis=1)  # [T]
+    codes = codes[win_ok]
+    np.add.at(counts, codes, 1)
+
+
+def kmer_to_index(kmer: str) -> int:
+    """
+    Convert k-mer string (ACGU only) to base-4 index.
+    Order matches lexicographic BASE_ORDER.
+    """
+    idx = 0
+    for c in kmer:
+        idx = idx * 4 + BASE_TO_ID[c]
+    return idx
+
+import pandas as pd
+
+def load_kmer_pseudocount_from_csv(
+    csv_path: str,
+    k: int,
+    dtype=np.float64,
+    normalize: bool = True,
+):
+    """
+    Returns:
+      pseudo: np.ndarray shape [4**k]
+    """
+    df = pd.read_csv(csv_path)   # columns: [kmer, count]
+    df.columns = ["kmer", "count"]
+
+    M = 4 ** k
+    pseudo = np.zeros(M, dtype=dtype)
+
+    for kmer, cnt in zip(df["kmer"], df["count"]):
+        # defensively handle DNA
+        kmer = kmer.replace("T", "U")
+        if len(kmer) != k:
+            continue
+        try:
+            idx = kmer_to_index(kmer)
+            pseudo[idx] += cnt
+        except KeyError:
+            # skip kmers with non-ACGU chars
+            continue
+
+    if normalize:
+        pseudo = pseudo / pseudo.sum()
+
+    return pseudo
+
+
 # from typing import Tuple, Sequence, Union
 class SpeciesSpecificJointSequenceBatchConverter(object):
     """Callable to convert an unprocessed (labels + strings) batch to a
@@ -282,6 +384,13 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         self.max_length = max_length
         self.random_validation = random_validation
         self.species_list = species_list
+        self.k_per_seq = 5
+        self.reference_kmer_utr5 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_5_kmers_{self.k_per_seq}_human.csv"
+        self.reference_kmer_utr3 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_3_kmers_{self.k_per_seq}_human.csv"
+        self.human_kmer_utr5 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr5, self.k_per_seq)
+        self.human_kmer_utr3 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr3, self.k_per_seq)
+        self.pseudo_kmer_alpha = 0.05  # weight for human kmer pseudocounts
+
         
 
     def __call__(self, 
@@ -319,11 +428,26 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         labels = []
         
         all_protein_sequence = []
-        
+        M = 4 ** self.k_per_seq
+        overall_counts_utr5 = np.zeros(M, dtype=np.float64)
+        batch_counts_utr5 = np.zeros((len(raw_batch), M), dtype=np.float64)
+        overall_counts_utr3 = np.zeros(M, dtype=np.float64)
+        batch_counts_utr3 = np.zeros((len(raw_batch), M), dtype=np.float64)
+
         for batch_idx, (label, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, species ) in enumerate(raw_batch):
             cds_sequence = _handle_special_nucleotides(cds_sequence, max_length=-1, replace_T=False)
             utr5_sequence = _handle_special_nucleotides(utr5_sequence, max_length=-1, replace_T=True)
             utr3_sequence = _handle_special_nucleotides(utr3_sequence, max_length=-1, replace_T=True)
+            
+            kmer_counts_from_text(utr5_sequence.replace("I", "A"), self.k_per_seq, batch_counts_utr5[batch_idx], mask=None)
+            kmer_counts_from_text(utr3_sequence.replace("I", "A"), self.k_per_seq, batch_counts_utr3[batch_idx], mask=None)
+            batch_counts_utr5[batch_idx] = batch_counts_utr5[batch_idx] + self.pseudo_kmer_alpha * len(utr5_sequence) * self.human_kmer_utr5
+            batch_counts_utr3[batch_idx] = batch_counts_utr3[batch_idx] + self.pseudo_kmer_alpha * len(utr3_sequence) * self.human_kmer_utr3
+            overall_counts_utr5 += batch_counts_utr5[batch_idx]
+            overall_counts_utr3 += batch_counts_utr3[batch_idx]
+            
+            batch_counts_utr5[batch_idx] = batch_counts_utr5[batch_idx] / batch_counts_utr5[batch_idx].sum()
+            batch_counts_utr3[batch_idx] = batch_counts_utr3[batch_idx] / batch_counts_utr3[batch_idx].sum()
             
             if self.random_validation == "utr5":
                 utr5_sequence = generate_random_sequence(len(utr5_sequence))
@@ -439,7 +563,15 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             
             species_idx = self.species_list.index(species)
             species_tensors[batch_idx] = species_idx
-            
+        
+        # process kmer counts
+        overall_counts_utr5 = overall_counts_utr5 / overall_counts_utr5.sum()
+        overall_counts_utr3 = overall_counts_utr3 / overall_counts_utr3.sum()
+        overall_kmer_utr5 = torch.tensor(overall_counts_utr5, dtype=torch.float32)
+        overall_kmer_utr3 = torch.tensor(overall_counts_utr3, dtype=torch.float32)
+        batch_kmer_utr5 = torch.tensor(batch_counts_utr5, dtype=torch.float32)
+        batch_kmer_utr3 = torch.tensor(batch_counts_utr3, dtype=torch.float32)
+        
         protein_input_ids = esm_tokenize(
                 all_protein_sequence, self.protein_tokenizer
             ).to(torch.int64)
@@ -500,7 +632,11 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             "utr5_mask": utr5_mask,
             "utr3_mask": utr3_mask,
             "cds_mask": cds_mask,
-            "modality_mask": modality_mask
+            "modality_mask": modality_mask,
+            "overall_kmer_utr5": overall_kmer_utr5,
+            "overall_kmer_utr3": overall_kmer_utr3,
+            "batch_kmer_utr5": batch_kmer_utr5,
+            "batch_kmer_utr3": batch_kmer_utr3,
         }
 
 

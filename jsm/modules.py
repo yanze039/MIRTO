@@ -14,13 +14,96 @@ try:
     import transformer_engine.pytorch as te
 except ImportError:
     te = None
-    
-from pytorch_lightning.utilities.model_summary import ModelSummary
+import torch.nn.functional as F
 
 def hamming_distance_numpy(s1, s2):
     a = np.frombuffer(s1.encode(), dtype=np.uint8)
     b = np.frombuffer(s2.encode(), dtype=np.uint8)
     return np.count_nonzero(a != b)
+
+
+BASE_ORDER = ["A", "C", "G", "U"]
+
+@torch.no_grad()
+def _kmer_index_table(k: int, device: torch.device) -> torch.Tensor:
+    grids = torch.meshgrid(*[torch.arange(4, device=device) for _ in range(k)], indexing="ij")
+    return torch.stack(grids, dim=-1).reshape(-1, k)  # [M, k], M=4**k
+
+
+def expected_kmer_dist_from_logits_masked(
+    logits: torch.Tensor,          # [B, L, V]
+    tok_to_idx: dict,
+    utr5_mask: torch.Tensor,     # [B, L] bool
+    utr3_mask: torch.Tensor,     # [B, L] bool
+    k: int,
+    eps: float = 1e-8,
+    normalize: bool = True,
+    idx_table: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Uses logits directly; internally uses log_softmax over (A,C,G,U).
+    Returns q: [B, 4**k] expected k-mer distribution restricted to region_mask.
+    """
+    B, L, V = logits.shape
+
+    # restrict to A,C,G,U logits: [B, L, 4]
+    idx4 = torch.tensor([tok_to_idx[b] for b in BASE_ORDER], device=logits.device)
+    sub_logits = logits.index_select(dim=-1, index=idx4)
+
+    # log probabilities over A,C,G,U: [B, L, 4]
+    logP = F.log_softmax(sub_logits, dim=-1)
+
+    T = L - k + 1
+    M = 4**k
+    if T <= 0:
+        return torch.full((B, M), 1.0 / M, device=logits.device, dtype=sub_logits.dtype)
+
+    # compute expected k-mer probs per start
+    log_terms = []
+    for i in range(k):
+        logP_slice = logP[:, i:i+T, :]  # [B, T, 4]
+        bases = idx_table[:, i].view(1, 1, -1).expand(B, T, -1)  # [B, T, M]
+        log_terms.append(torch.gather(logP_slice, dim=2, index=bases))
+
+    log_prod = torch.stack(log_terms, dim=0).sum(dim=0)  # [B, T, M]
+    p_kmer_at_t = log_prod.exp()                         # [B, T, M]
+
+    # mask invalid windows
+    # valid window starts inside region
+    win_ok_utr5 = utr5_mask.unfold(1, k, 1).all(dim=-1)  # [B, T]
+    any_win_utr5 = win_ok_utr5.any(dim=1)
+    p_kmer_at_t_utr5 = p_kmer_at_t * win_ok_utr5.to(p_kmer_at_t.dtype).unsqueeze(-1)
+    counts_utr5 = p_kmer_at_t_utr5.sum(dim=1)  # [B, M]
+    q_utr5 = counts_utr5 / counts_utr5.sum(dim=1, keepdim=True).clamp_min(eps)
+    if (~any_win_utr5).any():
+        q_utr5[~any_win_utr5] = 1.0 / M
+    
+    win_ok_utr3 = utr3_mask.unfold(1, k, 1).all(dim=-1)  # [B, T]
+    any_win_utr3 = win_ok_utr3.any(dim=1)
+    p_kmer_at_t_utr3 = p_kmer_at_t * win_ok_utr3.to(p_kmer_at_t.dtype).unsqueeze(-1)
+    counts_utr3 = p_kmer_at_t_utr3.sum(dim=1)  # [B, M]
+    q_utr3 = counts_utr3 / counts_utr3.sum(dim=1, keepdim=True).clamp_min(eps)
+    if (~any_win_utr3).any():
+        q_utr3[~any_win_utr3] = 1.0 / M
+
+    return q_utr5, q_utr3
+
+
+def js_divergence(q_model: torch.Tensor, q_ref: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    q_model: [B, M]
+    q_ref:   [M] or [B, M]
+    returns: [B]
+    """
+
+    q_m = q_model.clamp_min(eps)
+    q_r = q_ref.clamp_min(eps)
+    m = 0.5 * (q_m + q_r)
+
+    kl_m = (q_m * (q_m.log() - m.log())).sum(dim=-1)
+    kl_r = (q_r * (q_r.log() - m.log())).sum(dim=-1)
+    return 0.5 * (kl_m + kl_r)
+
 
 @dataclass
 class Loss:
@@ -38,6 +121,44 @@ class Loss:
     perplexity_utr5: Optional[torch.FloatTensor] = None
     perplexity_utr3: Optional[torch.FloatTensor] = None
     perplexity_codon: Optional[torch.FloatTensor] = None
+    divergence: Optional[torch.FloatTensor] = None
+    contrastive_loss: Optional[torch.FloatTensor] = None
+
+
+def info_nce_loss(features_a: torch.Tensor, features_b: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    """
+    Computes the InfoNCE loss between two sets of features.
+    Args:
+        features_a: Tensor of shape (batch_size, feature_dim)
+        features_b: Tensor of shape (batch_size, feature_dim)
+        temperature: Scaling factor for the logits
+    Returns:
+        Scalar tensor representing the InfoNCE loss
+    """
+    batch_size = features_a.shape[0]
+
+    logits = torch.matmul(features_a, features_b.T) / temperature
+    labels = torch.arange(batch_size, device=features_a.device)
+
+    loss_a_to_b = F.cross_entropy(logits, labels)
+    loss_b_to_a = F.cross_entropy(logits.T, labels)
+
+    loss = (loss_a_to_b + loss_b_to_a) * 0.5
+    return loss
+
+
+def grad_norm_autograd(loss, params):
+    grads = torch.autograd.grad(
+        loss,
+        params,
+        retain_graph=True,
+        allow_unused=True
+    )
+    total_norm = 0.0
+    for g in grads:
+        if g is not None:
+            total_norm += g.norm(2).item() ** 2
+    return total_norm ** 0.5
 
 
 class JointSequenceModeling(L.LightningModule):
@@ -142,6 +263,18 @@ class JointSequenceModeling(L.LightningModule):
         self.utr_3_tokenizer = utr_3_tokenizer
         self.strict_loading = False
         self.resumed_dataloader_state_from_ckpt = None
+        self.kmer_idx_table_cache = None
+        self.k = 5  # k-mer size for k-mer distribution calculation
+        if self.config.training.contrastive_training:
+            self.contrastive_protein_proj = nn.Linear(self.config.model.protein_hidden_size, 256)
+            self.contrastive_utr5_proj     = nn.Linear(self.config.model.d_model, 256)
+            self.contrastive_cds_proj      = nn.Linear(self.config.model.d_model, 256)
+            self.contrastive_utr3_proj     = nn.Linear(self.config.model.d_model, 256)
+        else:
+            self.contrastive_protein_proj = None
+            self.contrastive_utr5_proj     = None
+            self.contrastive_cds_proj      = None
+            self.contrastive_utr3_proj     = None
     
     def setup(self, stage=None):
         if self.config.backbone == 'hyena_nemo':
@@ -156,7 +289,6 @@ class JointSequenceModeling(L.LightningModule):
                     num_modalities=5,  # 5 modalities: 5' UTR, CDS, 3' UTR, padding, others)
                 )
         
-    
     def register_tokenizer(self, tokenizer_name, tokenizer):
         """Register a tokenizer to the model."""
         if tokenizer_name == "global":
@@ -203,7 +335,10 @@ class JointSequenceModeling(L.LightningModule):
                 inference_params=None,
                 modality_type_ids=batch['modality_type_ids'],
                 modality_mask=batch['modality_mask'],
+                return_middle_hidden_states=self.config.training.contrastive_training,
             )
+            if self.config.training.contrastive_training:
+                rna_logits = (*rna_logits, protein_embeddings)
         elif self.training_style == "standard":
             rna_logits = self.backbone(
                 input_ids=batch["rna_input_ids"],                 
@@ -218,8 +353,14 @@ class JointSequenceModeling(L.LightningModule):
             raise ValueError(f"Unknown training style: {self.training_style}")
         return rna_logits
     
-    def _loss(self, batch, prefix="train"):
-        rna_logits = self.forward(batch)
+    def _loss(self, batch, prefix='train'):
+        rna_outputs = self.forward(batch)
+        if self.config.training.contrastive_training:
+            rna_logits, middle_hidden_states, protein_embeddings = rna_outputs
+        else:
+            rna_logits = rna_outputs
+            middle_hidden_states = None
+            protein_embeddings = None
         
         utils.print_nans(rna_logits, 'rna_logits')
         
@@ -258,6 +399,62 @@ class JointSequenceModeling(L.LightningModule):
         rna_lm_loss_codon = (rna_lm_loss_per_token * cds_mask).sum() / torch.clamp(cds_mask.sum(), min=1.0)
         rna_lm_loss_utr3 = (rna_lm_loss_per_token * utr3_mask).sum() / torch.clamp(utr3_mask.sum(), min=1.0)
         rna_lm_loss = (rna_lm_loss_utr5 + rna_lm_loss_codon + rna_lm_loss_utr3) / 3.0
+        
+        # kmer alignment loss
+        divergence = None
+        if self.config.training.kmer_alignment:
+            if self.kmer_idx_table_cache is None:
+                self.kmer_idx_table_cache = _kmer_index_table(k=self.k, device=rna_logits.device)
+            kmer_utr_5, kmer_utr_3 = expected_kmer_dist_from_logits_masked(
+                rna_logits,
+                tok_to_idx=self.trainer.datamodule.utr_alphabet.tok_to_idx,
+                utr5_mask=utr5_mask.bool(),
+                utr3_mask=utr3_mask.bool(),
+                k=self.k,
+                idx_table=self.kmer_idx_table_cache,
+            )
+            
+            divergence_utr5 = js_divergence(kmer_utr_5, batch['batch_kmer_utr5']).mean()
+            divergence_utr3 = js_divergence(kmer_utr_3, batch['batch_kmer_utr3']).mean()
+            
+            divergence = 0.9 * divergence_utr5 + 0.1 * divergence_utr3
+            if self.config.training.kmer_alignment_warmup_steps > 0 and self.trainer.training:
+                if self.trainer.global_step < self.config.training.kmer_alignment_warmup_start:
+                    kmer_alignment_weight = 0.0
+                else:
+                    kmer_alignment_weight = (
+                        min(1.0, (self.trainer.global_step - self.config.training.kmer_alignment_warmup_start) / self.config.training.kmer_alignment_warmup_steps)
+                        * self.config.training.kmer_alignment_weight
+                    )
+            else:
+                kmer_alignment_weight = self.config.training.kmer_alignment_weight
+            rna_lm_loss = rna_lm_loss + kmer_alignment_weight * divergence
+        
+        if self.config.training.contrastive_training:
+            pooled_protein_embeddings = (protein_embeddings * batch['protein_padding_mask'].unsqueeze(-1)).sum(dim=1) / torch.clamp(batch['protein_padding_mask'].sum(dim=1, keepdim=True), min=1.0)
+            pooled_utr_5_embeddings = (middle_hidden_states * utr5_mask.unsqueeze(-1)).sum(dim=1) / torch.clamp(utr5_mask.sum(dim=1, keepdim=True), min=1.0)
+            pooled_cds_embeddings = (middle_hidden_states * cds_mask.unsqueeze(-1)).sum(dim=1) / torch.clamp(cds_mask.sum(dim=1, keepdim=True), min=1.0)
+            pooled_utr_3_embeddings = (middle_hidden_states * utr3_mask.unsqueeze(-1)).sum(dim=1) / torch.clamp(utr3_mask.sum(dim=1, keepdim=True), min=1.0)
+            protein_info = F.normalize(self.contrastive_protein_proj(pooled_protein_embeddings), dim=-1)
+            utr5_info = F.normalize(self.contrastive_utr5_proj(pooled_utr_5_embeddings), dim=-1)
+            cds_info = F.normalize(self.contrastive_cds_proj(pooled_cds_embeddings), dim=-1)
+            utr3_info = F.normalize(self.contrastive_utr3_proj(pooled_utr_3_embeddings), dim=-1)
+            info_nce_loss_utr5 = info_nce_loss(protein_info, utr5_info, temperature=self.config.training.contrastive_temperature)
+            info_nce_loss_cds = info_nce_loss(protein_info, cds_info, temperature=self.config.training.contrastive_temperature)
+            info_nce_loss_utr3 = info_nce_loss(protein_info, utr3_info, temperature=self.config.training.contrastive_temperature)
+            contrastive_loss = (info_nce_loss_utr5 + info_nce_loss_cds + info_nce_loss_utr3) / 3.0
+            # warm up the contrastive_weight
+            if self.config.training.contrastive_warmup_steps > 0 and self.trainer.training:
+                contrastive_weight = (
+                    min(1.0, self.trainer.global_step / self.config.training.contrastive_warmup_steps)
+                    * self.config.training.contrastive_weight
+                )
+            else:
+                contrastive_weight = self.config.training.contrastive_weight
+            rna_lm_loss = rna_lm_loss + contrastive_weight * contrastive_loss
+        else:
+            contrastive_loss = None
+            
         with torch.no_grad():
             perplexity_utr5 = torch.exp(rna_lm_loss_utr5)
             perplexity_codon = torch.exp(rna_lm_loss_codon)
@@ -273,6 +470,8 @@ class JointSequenceModeling(L.LightningModule):
             perplexity_utr5=perplexity_utr5,
             perplexity_codon=perplexity_codon,
             perplexity_utr3=perplexity_utr3,
+            divergence=divergence,
+            contrastive_loss=contrastive_loss,
         )
 
     def _compute_loss(self, batch, prefix='train'):
@@ -314,65 +513,6 @@ class JointSequenceModeling(L.LightningModule):
             batch_size=batch_size
         )
         
-        # self.log(
-        #     f"{prefix}/loss",
-        #     losses.loss,
-        #     on_step=on_step,
-        #     on_epoch=on_epoch,
-        #     prog_bar=True,
-        #     sync_dist=True,
-        #     batch_size=batch_size
-        # )
-        # self.log(name="rna_lm_loss_codon",
-        #         value=losses.rna_lm_loss_codon,
-        #         on_step=on_step,
-        #         on_epoch=on_epoch,
-        #         prog_bar=True,
-        #         sync_dist=True,
-        #         batch_size=batch_size
-        # )
-        # self.log(name="rna_lm_loss_utr5",
-        #         value=losses.rna_lm_loss_utr5,
-        #         on_step=on_step,
-        #         on_epoch=on_epoch,
-        #         prog_bar=True,
-        #         sync_dist=True,
-        #         batch_size=batch_size
-        # )
-        # self.log(name="rna_lm_loss_utr3",
-        #         value=losses.rna_lm_loss_utr3,
-        #         on_step=on_step,
-        #         on_epoch=on_epoch,
-        #         prog_bar=True,
-        #         sync_dist=True,
-        #         batch_size=batch_size
-        # )
-        
-        # self.log(name="perplexity_utr5",
-        #         value=losses.perplexity_utr5,
-        #         on_step=on_step,
-        #         on_epoch=on_epoch,
-        #         prog_bar=True,
-        #         sync_dist=True,
-        #         batch_size=batch_size
-        # )
-        # self.log(name="perplexity_codon",
-        #         value=losses.perplexity_codon,
-        #         on_step=on_step,
-        #         on_epoch=on_epoch,
-        #         prog_bar=True,
-        #         sync_dist=True,
-        #         batch_size=batch_size
-        # )
-        # self.log(name="perplexity_utr3",
-        #         value=losses.perplexity_utr3,
-        #         on_step=on_step,
-        #         on_epoch=on_epoch,
-        #         prog_bar=True,
-        #         sync_dist=True,
-        #         batch_size=batch_size
-        # )
-        
         if prefix == 'train':
             lr = self.trainer.optimizers[0].param_groups[0]['lr']
             self.log(name=f'{prefix}/lr',
@@ -387,6 +527,26 @@ class JointSequenceModeling(L.LightningModule):
                 self.codon_aa_errors.append(losses.num_codon_aa_errors)
             if hasattr(losses, "total_aa_length"):
                 self.total_length.append(losses.total_aa_length)
+        if self.config.training.kmer_alignment:
+            self.log(
+                name=f"{prefix}/kmer_js_divergence",
+                value=losses.divergence,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=True,
+                sync_dist=True,
+                batch_size=batch_size
+            )
+        if self.config.training.contrastive_training:
+            self.log(
+                name=f"{prefix}/contrastive_loss",
+                value=losses.contrastive_loss,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=True,
+                sync_dist=True,
+                batch_size=batch_size
+            )
         return losses
         
     def on_fit_start(self):
@@ -678,6 +838,45 @@ class JointSequenceModeling(L.LightningModule):
                 raise ValueError(f"Unknown style: {style}")
         else:
             return hidden_states
+    
+    @torch.no_grad()
+    def get_logits(
+            self, 
+            protein_sequence, 
+            utr5_sequence, 
+            cds_sequence, 
+            utr3_sequence,
+            species_id=None,
+        ):
+        tokens, protein_embeddings = tokenize_inputs(
+                protein_sequence, 
+                utr5_sequence,
+                cds_sequence,
+                utr3_sequence,
+                self.protein_tokenizer,
+                self.protein_encoder,
+                self.global_tokenizer,
+                self.codon_tokenizer,
+                self.utr_5_tokenizer,
+                self.utr_3_tokenizer
+        )
+        if species_id is not None:
+            species_input_ids = torch.tensor([species_id], device=protein_embeddings.device, dtype=torch.int64).view(1, 1)
+            species_input_ids = species_input_ids.repeat(1, 1)
+            logits = self.backbone.generating_forward(
+                tokens,
+                protein_embeddings,
+                return_hidden_states=False,
+                species_ids=species_input_ids,
+            )
+        else:
+            species_input_ids = None
+            logits = self.backbone.generating_forward(
+                    tokens,
+                    protein_embeddings,
+                    return_hidden_states=False,
+            )
+        return logits
     
     def get_attention_weights(
             self, 
