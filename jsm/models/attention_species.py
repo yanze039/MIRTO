@@ -366,21 +366,35 @@ class MixerModel(nn.Module):
             self, 
             hidden_states, 
             inference_params=None, 
-            hidden_layer_idx=None,
+            hidden_layer_indices=None,
             return_middle_hidden_states=False,
             **mixer_kwargs
         ):
         residual = None
         mid_layer_idx = len(self.layers) // 2
         middle_hidden_states = None
+        if hidden_layer_indices is not None:
+            hidden_states_dict = {}
+        else:
+            hidden_states_dict = None
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
-            if hidden_layer_idx is not None and layer.layer_idx == hidden_layer_idx:
-                return hidden_states + residual if residual is not None else hidden_states
+            if inference_params is not None:
+                if layer.layer_idx == inference_params.steering_layer_index and inference_params.steering_vector is not None:
+                    m = inference_params.steering.to(hidden_states.dtype).unsqueeze(1)   # [B,1]
+                    hidden_states[:, -1, :] = hidden_states[:, -1, :] + (m * inference_params.steering_weight) * inference_params.steering_vector
+                    inference_params.debug_counter.add_(inference_params.steering.sum().to(inference_params.debug_counter.dtype))
+            if hidden_layer_indices is not None and layer.layer_idx in hidden_layer_indices:
+                # return hidden_states + residual if residual is not None else hidden_states
+                hidden_states_dict[layer.layer_idx] = hidden_states + residual if residual is not None else hidden_states
             if return_middle_hidden_states and layer.layer_idx == mid_layer_idx:
                 middle_hidden_states = hidden_states + residual if residual is not None else hidden_states
+        
+        if hidden_layer_indices is not None:
+            return hidden_states_dict
+        
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -592,7 +606,7 @@ class SpeciesSpecificJointSequenceAttentionModel(nn.Module):
             return_hidden_states=True,
             inference_params=None, 
             num_last_tokens=0,
-            hidden_layer_idx=None
+            hidden_layer_indices=None
         ):
         B, Lr = input_ids.shape
         inputs_embeds = self.rna_embeddings(input_ids)  
@@ -606,7 +620,7 @@ class SpeciesSpecificJointSequenceAttentionModel(nn.Module):
         outputs = self.backbone(
             hidden_states=inputs_embeds,
             inference_params=inference_params,
-            hidden_layer_idx=hidden_layer_idx
+            hidden_layer_indices=hidden_layer_indices
         )
         if return_hidden_states:
             return outputs
@@ -621,12 +635,16 @@ class SpeciesSpecificJointSequenceAttentionModel(nn.Module):
             input_ids,                 
             protein_embeddings=None,
             inference_params=None, 
-            hidden_layer_idx=None
+            hidden_layer_idx=None,
+            species_ids=None,
         ):
         inputs_embeds = self.rna_embeddings(input_ids)  
         if protein_embeddings is not None:
             protein_embeddings = self.protein_align_head(self.protein_embedding_norm(protein_embeddings))   
             inputs_embeds = torch.cat([protein_embeddings, inputs_embeds], dim=1)
+        if species_ids is not None:
+            species_embeds = self.species_embedding(species_ids)
+            inputs_embeds = torch.cat([species_embeds, inputs_embeds], dim=1)
         attention_weights = self.backbone.calculate_attention_weights(
             hidden_states=inputs_embeds,
             inference_params=inference_params,

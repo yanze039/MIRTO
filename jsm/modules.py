@@ -176,7 +176,7 @@ class JointSequenceModeling(L.LightningModule):
     ):
         
         L.LightningModule.__init__(self)
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["protein_encoder", "tokenizer", "datamodule", "reference_model"])
         self.tokenizer = None
         self.config = config
         self.rna_vocab_size = rna_vocab_size
@@ -250,9 +250,10 @@ class JointSequenceModeling(L.LightningModule):
     
         # freeze protein encoder
         self.protein_encoder = protein_encoder
-        for param in self.protein_encoder.parameters():
-            param.requires_grad = False
-        self.protein_encoder.eval()
+        if self.protein_encoder is not None:
+            for param in self.protein_encoder.parameters():
+                param.requires_grad = False
+            self.protein_encoder.eval()
         self.rna_lm_loss_fn = nn.CrossEntropyLoss(
             ignore_index=self.padding_index,
             reduction="none"
@@ -265,6 +266,7 @@ class JointSequenceModeling(L.LightningModule):
         self.resumed_dataloader_state_from_ckpt = None
         self.kmer_idx_table_cache = None
         self.k = 5  # k-mer size for k-mer distribution calculation
+        
         if self.config.training.contrastive_training:
             self.contrastive_protein_proj = nn.Linear(self.config.model.protein_hidden_size, 256)
             self.contrastive_utr5_proj     = nn.Linear(self.config.model.d_model, 256)
@@ -475,6 +477,7 @@ class JointSequenceModeling(L.LightningModule):
         )
 
     def _compute_loss(self, batch, prefix='train'):
+        
         try:
             losses = self._loss(batch, prefix=prefix)
         except ValueError as e:
@@ -610,9 +613,10 @@ class JointSequenceModeling(L.LightningModule):
         if elapsed_time // 3600 > 1:
             self.trainer.should_stop = True
         self.backbone.train()
-        for param in self.protein_encoder.parameters():
-            param.requires_grad = False
-        self.protein_encoder.eval()        
+        if self.protein_encoder is not None:
+            for param in self.protein_encoder.parameters():
+                param.requires_grad = False
+            self.protein_encoder.eval()        
     
     def configure_optimizers(self):
         # TODO(yair): Lightning currently giving this warning when using `fp16`:
@@ -620,9 +624,10 @@ class JointSequenceModeling(L.LightningModule):
         #  Not clear if this is a problem or not.
         #  See: https://github.com/Lightning-AI/pytorch-lightning/issues/5558
         # trainable_parameters = [p for p in  if p.requires_grad]
-        for param in self.protein_encoder.parameters():
-            param.requires_grad = False
-        self.protein_encoder.eval()
+        if self.protein_encoder is not None:
+            for param in self.protein_encoder.parameters():
+                param.requires_grad = False
+            self.protein_encoder.eval()
         trainable_parameters = [p for p in self.backbone.parameters() if p.requires_grad]
         number_of_trainable_parameters = sum(p.numel() for p in trainable_parameters)
         print(f">>> Number of trainable parameters: {number_of_trainable_parameters}")
@@ -664,6 +669,7 @@ class JointSequenceModeling(L.LightningModule):
             'monitor': 'val/loss',
             'name': 'trainer/lr',
         }
+        print(f'Optimizer and scheduler configured.')
         return [optimizer], [scheduler_dict]
 
     def on_save_checkpoint(self, checkpoint):
@@ -699,7 +705,11 @@ class JointSequenceModeling(L.LightningModule):
     
     def on_load_checkpoint(self, checkpoint):
         print("loading checkpoint")
-        self.resumed_dataloader_state_from_ckpt = checkpoint['loops']['fit_loop']['state_dict']['combined_loader'][0]
+        if "combined_loader" in checkpoint['loops']['fit_loop']['state_dict']:
+            self.resumed_dataloader_state_from_ckpt = checkpoint['loops']['fit_loop']['state_dict']['combined_loader'][0]
+        else:
+            self.resumed_dataloader_state_from_ckpt = None
+            print("Warning: combined_loader not found in checkpoint. Dataloader state will not be restored.")
 
     @torch.no_grad()
     def generate(
@@ -718,6 +728,9 @@ class JointSequenceModeling(L.LightningModule):
             expected_utr_5_length=None,
             expected_utr_3_length=None,
             species_id=None,
+            steering_vector=None,
+            steering_layer_index=None,
+            steering_weight=1.0,
         ):
         
         """Generate RNA sequence from protein sequence."""
@@ -768,7 +781,10 @@ class JointSequenceModeling(L.LightningModule):
             progress_bar=progress_bar,
             cuda_monitor=cuda_monitor,
             expected_utr_5_length=expected_utr_5_length,
-            expected_utr_3_length=expected_utr_3_length
+            expected_utr_3_length=expected_utr_3_length,
+            steering_vector=steering_vector,
+            steering_layer_index=steering_layer_index,
+            steering_weight=steering_weight,
         )
         batch_size = output.sequences.shape[0]
         sequence_list = []
@@ -838,6 +854,51 @@ class JointSequenceModeling(L.LightningModule):
                 raise ValueError(f"Unknown style: {style}")
         else:
             return hidden_states
+        
+    @torch.no_grad()
+    def get_embedding(
+            self, 
+            protein_sequence, 
+            utr5_sequence, 
+            cds_sequence, 
+            utr3_sequence,
+            hidden_layer_indices=None,
+            species_id=None,
+        ):
+        tokens, protein_embeddings = tokenize_inputs(
+                protein_sequence, 
+                utr5_sequence,
+                cds_sequence,
+                utr3_sequence,
+                self.protein_tokenizer,
+                self.protein_encoder,
+                self.global_tokenizer,
+                self.codon_tokenizer,
+                self.utr_5_tokenizer,
+                self.utr_3_tokenizer
+        )
+        if species_id is not None:
+            species_input_ids = torch.tensor([species_id], device=protein_embeddings.device, dtype=torch.int64).view(1, 1)
+            species_input_ids = species_input_ids.repeat(1, 1)
+            hidden_states = self.backbone.generating_forward(
+                tokens,
+                protein_embeddings,
+                return_hidden_states=True,
+                hidden_layer_indices=hidden_layer_indices,
+                species_ids=species_input_ids,
+            )
+        else:
+            species_input_ids = None
+            hidden_states = self.backbone.generating_forward(
+                    tokens,
+                    protein_embeddings,
+                    return_hidden_states=True,
+                    hidden_layer_indices=hidden_layer_indices
+            )
+        
+        seq_length = tokens.shape[1]
+        hidden_states = {layer_idx: hidden_state[:, -seq_length:, :] for layer_idx, hidden_state in hidden_states.items()}
+        return hidden_states
     
     @torch.no_grad()
     def get_logits(
@@ -884,7 +945,7 @@ class JointSequenceModeling(L.LightningModule):
             utr5_sequence, 
             cds_sequence, 
             utr3_sequence,
-            hidden_layer_idx=None
+            species_id=None,
         ):
         tokens, protein_embeddings = tokenize_inputs(
                 protein_sequence, 
@@ -898,10 +959,20 @@ class JointSequenceModeling(L.LightningModule):
                 self.utr_5_tokenizer,
                 self.utr_3_tokenizer
         )
-        attention_weights = self.backbone.calculate_attention_weights(
-                tokens,
-                protein_embeddings,
-        )
+        if species_id is not None:
+            species_input_ids = torch.tensor([species_id], device=protein_embeddings.device, dtype=torch.int64).view(1, 1)
+            species_input_ids = species_input_ids.repeat(1, 1)
+            attention_weights = self.backbone.calculate_attention_weights(
+                    tokens,
+                    protein_embeddings,
+                    species_ids=species_input_ids,
+            )
+        else:
+            species_input_ids = None
+            attention_weights = self.backbone.calculate_attention_weights(
+                    tokens,
+                    protein_embeddings,
+            )
         return attention_weights
         
     

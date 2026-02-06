@@ -1,14 +1,11 @@
 import os
-import lmdb
 import random
 from typing import Optional, Union, Sequence
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
 import lightning.pytorch as pl
+import pandas as pd
 from pathlib import Path
 from .utils import (Alphabet, 
                     nucleotide_label_combination_rules, 
@@ -21,7 +18,9 @@ from .utils import (Alphabet,
                     )
 import msgpack
 import zstandard as zstd
-
+from lightning.pytorch.utilities.combined_loader import CombinedLoader
+from .species_specific import SpeciesSpecificJointSequenceLMDBSequenceDataset, SpeciesSpecificJointSequenceBatchConverter
+import re
 
 def is_main_process():
     if dist.is_initialized():
@@ -62,60 +61,251 @@ def save_compressed_msgpack(file_path, obj):
         fp.write(compressed)
     print(f"Saved compressed msgpack to {file_path}")
 
-class SpeciesSpecificJointSequenceLMDBSequenceDataset(Dataset):
+class DPOUTR5SpeciesSpecificJointSequenceSequenceDataset(Dataset):
     def __init__(
             self, 
-            lmdb_path,
+            data_file_path,
             metadata_path,
-            keys=None,
+            mode='train',
+            dataset_size_multiplier=4.0,
         ):
         """
         Initialize the LMDB dataset for direct retrieval.
-        :param lmdb_path: Path to the LMDB file
+        :param data_file_path: Path to the LMDB file
         :param keys: List of known keys (sequence IDs)
         """
-        self.lmdb_path = str(lmdb_path)
-        self.env = lmdb.open(self.lmdb_path, readonly=True, 
-                             lock=False, readahead=True, 
-                             meminit=False, subdir=False,
-                             map_size=200 * 1024 * 1024 * 1024)
-        # If keys are not provided, retrieve all keys from the LMDB file
-        if keys is None:
-            with self.env.begin() as txn:
-                self.keys = [key.decode("ascii") for key, _ in txn.cursor()]
-        else:
-            self.keys = keys  # Use the provided list of keys
-        self.txn = self.env.begin(write=False)
+        assert mode in ['train', 'val', 'test'], "mode must be 'train', 'val' or 'test'"
+        self.data_file_path = str(data_file_path)
+        self.data = pd.read_csv(self.data_file_path)
+        self.data = self.data[self.data['split'] == mode]
+        
+        
+        self.mode = mode
         self.decompressor = zstd.ZstdDecompressor()
         self.protein_max_length = 2048
         self.rna_max_length = 8000
         
         self.metadata_path = metadata_path
         self.metadata = read_compressed_msgpack(self.metadata_path)
+        self.human_data = self.data[self.data['source'] == 'human']
+        self.positive_generated_data = self.data[(self.data['label'] == 1) & (self.data['source'] == 'generation')]
+        self.negative_data = self.data[self.data['label'] == -1]
+        
+        self.strategy_weight = {
+            "human_only": {
+                'human_vs_negative': 60,
+                'human_vs_repeating': 30,
+                'human_vs_empty': 10,
+            },
+            "positive_generated": {
+                'human_vs_positive': 50,
+                'positive_vs_repeating': 20,
+                'positive_vs_negative': 10,
+                'positive_vs_kozak': 20,
+                'positive_vs_empty': 10,
+                'positive_gc_high_vs_low': 20,
+            }
+        }
+        self.strategy_human_only = sorted(list(self.strategy_weight['human_only'].keys()))
+        self.weight_human_only = [self.strategy_weight['human_only'][k] for k in self.strategy_human_only]
+        self.strategy_positive_generated = sorted(list(self.strategy_weight['positive_generated'].keys()))
+        self.weight_positive_generated = [self.strategy_weight['positive_generated'][k] for k in self.strategy_positive_generated]
+        
+        self.keys_human_only = self.human_data['refseq_id'].unique().tolist()
+        self.keys_positive_generated = self.positive_generated_data['refseq_id'].unique().tolist()
+        self.keys = self.keys_human_only + self.keys_positive_generated
+        self.keys = self.keys * int(dataset_size_multiplier)  # augment the dataset size by 4 times
+        random.shuffle(self.keys)
 
     def __len__(self):
         """Returns total number of stored sequences."""
         return len(self.keys)
 
     def __getitem__(self, idx):
-        
+        """Retrieves a sequence by its key."""
         seq_id = self.keys[idx]  # Get the sequence ID
-        if not hasattr(self, "txn"):
-            self.txn = self.env.begin(write=False)
+        
+        # if it is in positive generated data
+        # - we have 6 options:
+        # - 1. choose human, choose positive, human > positive.
+        # - 2. choose positive, choose negative, positive > negative.
+        # - 3. choose positive, check if has kozak seq, if not, add kozak seq. Kozak > no kozak.
+        # - 4. choose positive, positive > empty generation.
+        # - 5. choose positive, positive > 3-nt generation.
+        # - 6. choose two positives, higher GC content > lower GC content.
 
-        value = self.txn.get(seq_id.encode("ascii"))  # Retrieve sequence
-        if value is None:
-            raise KeyError(f"Sequence ID {seq_id} not found in LMDB")
-
-        # value = pickle.loads(value)  # Deserialize the sequence
-        value = msgpack.unpackb(self.decompressor.decompress(value), raw=False)  # raw=False for str instead of bytes
-        # replace T with U
-        protein_sequence = value[0]
-        utr5_sequence = value[1]
-        cds_sequence = value[2]
-        utr3_sequence = value[3]
+        in_positive_generated = seq_id in self.positive_generated_data['refseq_id'].values
+        if in_positive_generated:
+            strategy = random.choices(
+                self.strategy_positive_generated,
+                weights=self.weight_positive_generated,
+                k=1
+            )[0]
+            if strategy == 'human_vs_positive':
+                return self.compare_human_generated(seq_id)
+            elif strategy == 'positive_vs_negative':
+                return self.compare_generated_negative(seq_id)
+            
+            sub_positive_data = self.positive_generated_data[self.positive_generated_data['refseq_id'] == seq_id]
+            if len(sub_positive_data) < 2 and strategy == 'positive_gc_high_vs_low':
+                return self.compare_human_generated(seq_id)
+            elif strategy == 'positive_gc_high_vs_low':
+                paired_positive_samples = sub_positive_data.sample(n=2)
+                pos_sample1 = paired_positive_samples.iloc[0]
+                pos_sample2 = paired_positive_samples.iloc[1]
+                gc_content1 = self.calculate_gc_content(pos_sample1['utr5_sequence'])
+                gc_content2 = self.calculate_gc_content(pos_sample2['utr5_sequence'])
+                if gc_content1 >= gc_content2:
+                    utr5_sequence_chosen = pos_sample1['utr5_sequence']
+                    utr5_sequence_rejected = pos_sample2['utr5_sequence']
+                    protein_sequence = pos_sample1['protein_sequence']
+                else:
+                    utr5_sequence_chosen = pos_sample2['utr5_sequence']
+                    utr5_sequence_rejected = pos_sample1['utr5_sequence']
+                    protein_sequence = pos_sample2['protein_sequence']
+                species = self.metadata.get(seq_id, "Unknown")
+                return seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species
+            positive_sample = sub_positive_data.sample(n=1).iloc[0]
+            protein_sequence = positive_sample['protein_sequence']
+            species = self.metadata.get(seq_id, "Unknown")
+            if strategy == 'positive_vs_kozak':
+                utr5_sequence_chosen = self.mock_kozak_sequence(positive_sample['utr5_sequence'])
+                utr5_sequence_rejected = positive_sample['utr5_sequence']
+            elif strategy == 'positive_vs_empty':
+                utr5_sequence_chosen = positive_sample['utr5_sequence']
+                utr5_sequence_rejected = self.mock_empty_or_short_sequence(max_length=6)
+            elif strategy == 'positive_vs_repeating':
+                utr5_sequence_chosen = positive_sample['utr5_sequence']
+                utr5_sequence_rejected = self.mock_repeating_sequence(positive_sample['utr5_sequence'])
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+            return seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species
+                
+        else:
+            strategy = random.choices(
+                self.strategy_human_only,
+                weights=self.weight_human_only,
+                k=1
+            )[0]
+            if strategy == 'human_vs_negative':
+                return self.compare_human_negative(seq_id)
+            sub_human_data = self.human_data[self.human_data['refseq_id'] == seq_id]
+            human_sequence_sample = sub_human_data.sample(n=1).iloc[0]
+            protein_sequence = human_sequence_sample['protein_sequence']
+            species = self.metadata.get(seq_id, "Unknown")
+            if strategy == 'human_vs_repeating':
+                utr5_sequence_chosen = human_sequence_sample['utr5_sequence']
+                utr5_sequence_rejected = self.mock_repeating_sequence(human_sequence_sample['utr5_sequence'])
+            elif strategy == 'human_vs_empty':
+                utr5_sequence_chosen = human_sequence_sample['utr5_sequence']
+                utr5_sequence_rejected = self.mock_empty_or_short_sequence(max_length=6)
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+            return seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species
+                
+        
+        
+        # sub_data = self.data[self.data['refseq_id'] == seq_id]
+        # positive_samples = sub_data[sub_data['label'] == 1]
+        # negative_samples = sub_data[sub_data['label'] == -1]
+        # # sample one positive and one negative
+        # positive_sample = positive_samples.sample(n=1).iloc[0]
+        # negative_sample = negative_samples.sample(n=1).iloc[0]
+        # protein_sequence = positive_sample['protein_sequence']
+        # utr5_sequence_chosen = positive_sample['utr5_sequence']
+        # utr5_sequence_rejected = negative_sample['utr5_sequence']
+        # species = self.metadata.get(seq_id, "Unknown")
+        # return seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species
+    
+    def compare_human_generated(self, seq_id):
+        sub_human_data = self.human_data[self.human_data['refseq_id'] == seq_id]
+        sub_generated_data = self.positive_generated_data[self.positive_generated_data['refseq_id'] == seq_id]
+        if len(sub_human_data) == 0 or len(sub_generated_data) == 0:
+            raise ValueError("No human or generated data for this seq_id")
+        human_sample = sub_human_data.sample(n=1).iloc[0]
+        generated_sample = sub_generated_data.sample(n=1).iloc[0]
+        protein_sequence = human_sample['protein_sequence']
+        utr5_sequence_chosen = human_sample['utr5_sequence']
+        utr5_sequence_rejected = generated_sample['utr5_sequence']
         species = self.metadata.get(seq_id, "Unknown")
-        return seq_id, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, species
+        return seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species
+    
+    def compare_generated_negative(self, seq_id):
+        sub_positive_data = self.positive_generated_data[self.positive_generated_data['refseq_id'] == seq_id]
+        sub_negative_data = self.negative_data[self.negative_data['refseq_id'] == seq_id]
+        if len(sub_positive_data) == 0 or len(sub_negative_data) == 0:
+            raise ValueError("No positive or negative generated data for this seq_id")
+        positive_sample = sub_positive_data.sample(n=1).iloc[0]
+        negative_sample = sub_negative_data.sample(n=1).iloc[0]
+        protein_sequence = positive_sample['protein_sequence']
+        utr5_sequence_chosen = positive_sample['utr5_sequence']
+        utr5_sequence_rejected = negative_sample['utr5_sequence']
+        # 75% relabel the negative sequence
+        # if random.random() < 0.75:
+        utr5_sequence_rejected = self.mock_repeating_by_relabel_negative(utr5_sequence_rejected)
+        species = self.metadata.get(seq_id, "Unknown")
+        return seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species
+    
+    def compare_human_negative(self, seq_id):
+        sub_human_data = self.human_data[self.human_data['refseq_id'] == seq_id]
+        sub_negative_data = self.negative_data[self.negative_data['refseq_id'] == seq_id]
+        if len(sub_human_data) == 0 or len(sub_negative_data) == 0:
+            raise ValueError("No human or negative generated data for this seq_id")
+        human_sample = sub_human_data.sample(n=1).iloc[0]
+        negative_sample = sub_negative_data.sample(n=1).iloc[0]
+        protein_sequence = human_sample['protein_sequence']
+        utr5_sequence_chosen = human_sample['utr5_sequence']
+        utr5_sequence_rejected = negative_sample['utr5_sequence']
+        # 75% relabel the negative sequence
+        # if random.random() < 0.75:
+        utr5_sequence_rejected = self.mock_repeating_by_relabel_negative(utr5_sequence_rejected)
+        species = self.metadata.get(seq_id, "Unknown")
+        return seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species
+    
+    def mock_repeating_by_relabel_negative(self, sequence):
+        # keep pattern but only shuffle the letters
+        relabeled_seq, _ = self.random_rna_relabel(sequence)
+        return relabeled_seq
+    
+    @staticmethod
+    def random_rna_relabel(seq):
+        seq = seq.strip().upper().replace("T", "U")
+        nts = ['A', 'U', 'C', 'G']
+        perm = nts.copy()
+        random.shuffle(perm)
+
+        mapping = dict(zip(nts, perm))
+        relabeled = ''.join(mapping[nt] for nt in seq)
+        return relabeled, mapping
+        
+    def mock_repeating_sequence(self, sequence):
+        repeating_nt = random.choice(['A', 'U', 'C', 'G'])
+        repeating_length = random.randint(5, 10)
+        # randomly mask a segment in the sequence with the repeating nt
+        start_idx = random.randint(0, max(0, len(sequence) - repeating_length - 1))
+        new_sequence = sequence[:start_idx] + repeating_nt * repeating_length + sequence[start_idx + repeating_length:]
+        return new_sequence
+    
+    def mock_kozak_sequence(self, sequence):
+        kozak_sequence_pattern = re.compile(r'[AG]CC$')
+        # check if there is already a kozak sequence
+        if kozak_sequence_pattern.search(sequence):
+            return sequence
+        else:
+            new_sequence = sequence + "GCCACC"
+            return new_sequence
+    
+    def mock_empty_or_short_sequence(self, max_length=6):
+        length = random.choice(range(0, max_length+1))
+        if length == 0:
+            return ""
+        else:
+            nt = random.choices(['A', 'U', 'C', 'G'], k=length)
+            return "".join(nt)
+    
+    def calculate_gc_content(self, sequence):
+        gc_count = sequence.count('G') + sequence.count('C')
+        return gc_count / len(sequence) if len(sequence) > 0 else 0.0
     
     def close(self):
         if hasattr(self, "txn"):
@@ -255,110 +445,7 @@ def generate_random_sequence(sequence_length):
     return nas
 
 
-import numpy as np
-
-BASE_ORDER = ["A", "C", "G", "U"]
-BASE_TO_ID = {b: i for i, b in enumerate(BASE_ORDER)}
-BASE_MAP = np.full(256, -1, dtype=np.int16)
-BASE_MAP[ord('A')] = 0
-BASE_MAP[ord('C')] = 1
-BASE_MAP[ord('G')] = 2
-BASE_MAP[ord('U')] = 3
-BASE_MAP[ord('T')] = 3  # if your sequences sometimes use T
-
-def kmer_counts_from_text(seq: str, k: int, counts: np.ndarray, mask: np.ndarray | None = None):
-    """
-    Update `counts` (shape [4**k]) in place with k-mer counts from `seq`.
-    - seq: raw string of A/C/G/U (T allowed -> treated as U)
-    - mask: optional bool array of shape [len(seq)], True = include this position.
-            A window is counted only if ALL k positions are True and valid bases.
-    """
-    s = seq.upper().encode("ascii", "ignore")
-    x = BASE_MAP[np.frombuffer(s, dtype=np.uint8)]  # [-1,0,1,2,3], shape [L]
-    L = x.shape[0]
-    T = L - k + 1
-    if T <= 0:
-        return
-
-    valid = (x >= 0)
-    if mask is not None:
-        # mask could exclude separators / special region boundaries etc.
-        valid = valid & mask.astype(bool)
-
-    # window valid if all k positions valid
-    # compute via convolution-like sliding AND (vectorized)
-    # (small k, so this is fine)
-    win_ok = valid[:T].copy()
-    for i in range(1, k):
-        win_ok &= valid[i:i+T]
-
-    if not win_ok.any():
-        return
-
-    # rolling base-4 code: code[t] = sum_{i=0..k-1} x[t+i] * 4^(k-1-i)
-    weights = (4 ** np.arange(k-1, -1, -1, dtype=np.int64))  # [k]
-    # build codes vectorized using dot over a strided view
-    # shape: [T, k]
-    Xw = np.lib.stride_tricks.as_strided(
-        x,
-        shape=(T, k),
-        strides=(x.strides[0], x.strides[0]),
-        writeable=False
-    ).astype(np.int64)
-
-    codes = (Xw * weights).sum(axis=1)  # [T]
-    codes = codes[win_ok]
-    np.add.at(counts, codes, 1)
-
-
-def kmer_to_index(kmer: str) -> int:
-    """
-    Convert k-mer string (ACGU only) to base-4 index.
-    Order matches lexicographic BASE_ORDER.
-    """
-    idx = 0
-    for c in kmer:
-        idx = idx * 4 + BASE_TO_ID[c]
-    return idx
-
-import pandas as pd
-
-def load_kmer_pseudocount_from_csv(
-    csv_path: str,
-    k: int,
-    dtype=np.float64,
-    normalize: bool = True,
-):
-    """
-    Returns:
-      pseudo: np.ndarray shape [4**k]
-    """
-    df = pd.read_csv(csv_path)   # columns: [kmer, count]
-    df.columns = ["kmer", "count"]
-
-    M = 4 ** k
-    pseudo = np.zeros(M, dtype=dtype)
-
-    for kmer, cnt in zip(df["kmer"], df["count"]):
-        # defensively handle DNA
-        kmer = kmer.replace("T", "U")
-        if len(kmer) != k:
-            continue
-        try:
-            idx = kmer_to_index(kmer)
-            pseudo[idx] += cnt
-        except KeyError:
-            # skip kmers with non-ACGU chars
-            continue
-
-    if normalize:
-        pseudo = pseudo / pseudo.sum()
-
-    return pseudo
-
-
-# from typing import Tuple, Sequence, Union
-class SpeciesSpecificJointSequenceBatchConverter(object):
+class UTRSpeciesSpecificJointSequenceBatchConverter(object):
     """Callable to convert an unprocessed (labels + strings) batch to a
     processed (labels + tensor) batch.
     """
@@ -371,7 +458,7 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             protein_tokenizer,
             max_length=None,
             random_validation=None,
-            species_list=['Homo sapiens']
+            species_list=['Homo sapiens'],
         ):
         self.global_tokenizer = global_alphabet
         self.utr_5_tokenizer = utr_alphabet
@@ -383,31 +470,23 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         self.max_length = max_length
         self.random_validation = random_validation
         self.species_list = species_list
-        # self.k_per_seq = 5
-        # self.reference_kmer_utr5 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_5_kmers_{self.k_per_seq}_human.csv"
-        # self.reference_kmer_utr3 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_3_kmers_{self.k_per_seq}_human.csv"
-        # self.human_kmer_utr5 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr5, self.k_per_seq)
-        # self.human_kmer_utr3 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr3, self.k_per_seq)
-        # self.pseudo_kmer_alpha = 0.05  # weight for human kmer pseudocounts
 
         
 
-    def __call__(self, 
-                 raw_batch: Sequence,
-                 ):
-        # if self.nested_tensor:
-            # return self.convert_nested_tensor_batch(raw_batch)
-        # RoBERTa uses an eos token, while ESM-1 does not.
+    def __call__(
+            self, 
+            raw_batch: Sequence,
+        ):
         batch_size = len(raw_batch)
-        max_len = max((len(utr5_sequence) + len(cds_sequence)//3 + len(utr3_sequence)) \
-                    for _, _, utr5_sequence, cds_sequence, utr3_sequence, _ in raw_batch)
+        max_len = max((len(utr5_sequence) + len(protein_sequence)) \
+            for seq_id, protein_sequence, utr5_sequence, species in raw_batch
+        )
         # seq_id, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence
         tokens = torch.empty(
             (
                 batch_size,
                 max_len
-                + 2  # global special tokens <cls> and <eos>
-                + 2 * 3  # <cls> and <eos> for each modality, serving as boundary
+                + 3  # global special tokens <cls> and <eos>
             ),
             dtype=torch.int64,
         )
@@ -415,8 +494,7 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             (
                 batch_size,
                 max_len
-                + 2  # global special tokens <cls> and <eos>
-                + 2 * 3  # <cls> and <eos> for each modality, serving as boundary
+                + 3
             ),
             dtype=torch.int64,
         )
@@ -424,43 +502,15 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         tokens.fill_(self.global_tokenizer.padding_idx)
         modality_type_tensors.fill_(self.modality_map["padding"])
         translation_rna_mask = torch.zeros_like(modality_type_tensors)
-        special_token_mask = torch.zeros_like(modality_type_tensors)
         labels = []
         
         all_protein_sequence = []
-        # M = 4 ** self.k_per_seq
-        # overall_counts_utr5 = np.zeros(M, dtype=np.float64)
-        # batch_counts_utr5 = np.zeros((len(raw_batch), M), dtype=np.float64)
-        # overall_counts_utr3 = np.zeros(M, dtype=np.float64)
-        # batch_counts_utr3 = np.zeros((len(raw_batch), M), dtype=np.float64)
 
-        for batch_idx, (label, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, species ) in enumerate(raw_batch):
-            cds_sequence = _handle_special_nucleotides(cds_sequence, max_length=-1, replace_T=False)
+        for batch_idx, (label, protein_sequence, utr5_sequence, species ) in enumerate(raw_batch):
             utr5_sequence = _handle_special_nucleotides(utr5_sequence, max_length=-1, replace_T=True)
-            utr3_sequence = _handle_special_nucleotides(utr3_sequence, max_length=-1, replace_T=True)
-            
-            # kmer_counts_from_text(utr5_sequence.replace("I", "A"), self.k_per_seq, batch_counts_utr5[batch_idx], mask=None)
-            # kmer_counts_from_text(utr3_sequence.replace("I", "A"), self.k_per_seq, batch_counts_utr3[batch_idx], mask=None)
-            # batch_counts_utr5[batch_idx] = batch_counts_utr5[batch_idx] + self.pseudo_kmer_alpha * len(utr5_sequence) * self.human_kmer_utr5
-            # batch_counts_utr3[batch_idx] = batch_counts_utr3[batch_idx] + self.pseudo_kmer_alpha * len(utr3_sequence) * self.human_kmer_utr3
-            # overall_counts_utr5 += batch_counts_utr5[batch_idx]
-            # overall_counts_utr3 += batch_counts_utr3[batch_idx]
-            
-            # batch_counts_utr5[batch_idx] = batch_counts_utr5[batch_idx] / batch_counts_utr5[batch_idx].sum()
-            # batch_counts_utr3[batch_idx] = batch_counts_utr3[batch_idx] / batch_counts_utr3[batch_idx].sum()
-            
-            if self.random_validation == "utr5":
-                utr5_sequence = generate_random_sequence(len(utr5_sequence))
-            elif self.random_validation == "utr3":
-                utr3_sequence = generate_random_sequence(len(utr3_sequence))
-            elif self.random_validation is None:
-                pass
-            else:
-                raise ValueError(f"Unknown random validation type: {self.random_validation}")
 
             labels.append(label)
             tokens[batch_idx, 0] = self.global_tokenizer.cls_idx
-            special_token_mask[batch_idx, 0] = 1
             modality_type_tensors[batch_idx, 0] = self.modality_map["global_special_tokens"]
             all_protein_sequence.append(protein_sequence)
             
@@ -472,7 +522,6 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
                 batch_idx,
                 1,
             ] = self.global_tokenizer.get_idx("<utr_5_bos>")
-            special_token_mask[batch_idx, 1] = 1
             modality_type_tensors[
                 batch_idx,
                 1
@@ -489,95 +538,13 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
                 batch_idx,
                 2 + len(utr_5_tensor)
             ] = self.global_tokenizer.get_idx("<utr_5_eos>")
-            special_token_mask[batch_idx, 2 + len(utr_5_tensor)] = 1
             modality_type_tensors[
                 batch_idx,
                 2 + len(utr_5_tensor)
             ] = self.modality_map["utr_5"]
-            
-            # >>> Codon Section <<<
-            codon_list = [cds_sequence[i:i+3] for i in range(0, len(cds_sequence), 3)]
-            assert len(codon_list) == len(protein_sequence) + 1, \
-                f"irregular cds sequences that don't match protein, {len(codon_list)}, {len(protein_sequence)}"
-            codon_tensor   = torch.tensor(
-                [self.codon_tokenizer.get_idx(codon_list[i]) for i in range(0, len(codon_list))], dtype=torch.int64
-            ) 
-            tokens[
-                batch_idx,
-                3 + len(utr_5_tensor),
-            ] = self.global_tokenizer.get_idx("<cds_bos>")
-            special_token_mask[batch_idx, 3 + len(utr_5_tensor)] = 1
-            modality_type_tensors[
-                batch_idx,
-                3 + len(utr_5_tensor),
-            ] = self.modality_map["cds"]
-            tokens[
-                batch_idx,
-                4 + len(utr_5_tensor) : 4 + len(utr_5_tensor) + len(codon_tensor),
-            ] = codon_tensor
-            modality_type_tensors[
-                batch_idx,
-                4 + len(utr_5_tensor) : 4 + len(utr_5_tensor) + len(codon_tensor),
-            ] = self.modality_map["cds"]
-            tokens[
-                batch_idx,
-                4 + len(utr_5_tensor) + len(codon_tensor)
-            ] = self.global_tokenizer.get_idx("<cds_eos>")
-            special_token_mask[batch_idx, 4 + len(utr_5_tensor) + len(codon_tensor)] = 1
-            modality_type_tensors[
-                batch_idx,
-                4 + len(utr_5_tensor) + len(codon_tensor)
-            ] = self.modality_map["cds"]
-            translation_rna_mask[
-                batch_idx,
-                4 + len(utr_5_tensor) : 4 + len(utr_5_tensor) + len(codon_tensor) - 1 ,
-            ] = 1
-
-            # >>> 3' UTR Section <<<
-            utr_3_tensor = torch.tensor(
-                [self.utr_3_tokenizer.get_idx(utr3_sequence[i]) for i in range(0, len(utr3_sequence))], dtype=torch.int64
-            ) 
-            tokens[
-                batch_idx,
-                4 + len(utr_5_tensor) + len(codon_tensor) +1,
-            ] = self.global_tokenizer.get_idx("<utr_3_bos>")
-            special_token_mask[batch_idx, 4 + len(utr_5_tensor) + len(codon_tensor) +1] = 1
-            modality_type_tensors[
-                batch_idx,
-                4 + len(utr_5_tensor) + len(codon_tensor) +1,
-            ] = self.modality_map["utr_3"]
-            tokens[
-                batch_idx,
-                4 + len(utr_5_tensor) + len(codon_tensor) +2 : 4 + len(utr_5_tensor) + len(codon_tensor) +2 + len(utr_3_tensor),
-            ] = utr_3_tensor
-            modality_type_tensors[
-                batch_idx,
-                4 + len(utr_5_tensor) + len(codon_tensor) +2 : 4 + len(utr_5_tensor) + len(codon_tensor) +2 + len(utr_3_tensor),
-            ] = self.modality_map["utr_3"]
-            tokens[
-                batch_idx,
-                6 + len(utr_5_tensor) + len(codon_tensor) + len(utr_3_tensor)
-            ] = self.global_tokenizer.get_idx("<utr_3_eos>")
-            special_token_mask[batch_idx, 6 + len(utr_5_tensor) + len(codon_tensor) + len(utr_3_tensor)] = 1
-            modality_type_tensors[
-                batch_idx,
-                6 + len(utr_5_tensor) + len(codon_tensor) + len(utr_3_tensor)
-            ] = self.modality_map["utr_3"]
-            
-            # global eos
-            tokens[batch_idx, 7 + len(utr_5_tensor) + len(codon_tensor) + len(utr_3_tensor)] = self.global_tokenizer.eos_idx
-            modality_type_tensors[batch_idx, 7 + len(utr_5_tensor) + len(codon_tensor) + len(utr_3_tensor)] = self.modality_map["global_special_tokens"]
-            special_token_mask[batch_idx, 7 + len(utr_5_tensor) + len(codon_tensor) + len(utr_3_tensor)] = 1
+                        
             species_idx = self.species_list.index(species)
             species_tensors[batch_idx] = species_idx
-        
-        # process kmer counts
-        # overall_counts_utr5 = overall_counts_utr5 / overall_counts_utr5.sum()
-        # overall_counts_utr3 = overall_counts_utr3 / overall_counts_utr3.sum()
-        # overall_kmer_utr5 = torch.tensor(overall_counts_utr5, dtype=torch.float32)
-        # overall_kmer_utr3 = torch.tensor(overall_counts_utr3, dtype=torch.float32)
-        # batch_kmer_utr5 = torch.tensor(batch_counts_utr5, dtype=torch.float32)
-        # batch_kmer_utr3 = torch.tensor(batch_counts_utr3, dtype=torch.float32)
         
         protein_input_ids = esm_tokenize(
                 all_protein_sequence, self.protein_tokenizer
@@ -610,15 +577,11 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         inverse_indices = torch.empty_like(row_wise_col_perms)
         inverse_indices.scatter_(1, row_wise_col_perms, arange_tensor)
         attention_mask = torch.gather(joint_masking, dim=1, index=row_wise_col_perms).to(torch.int64)
-        # indices, cu_seqlens, _ = get_unpad_data(attention_mask)
         seqlens = attention_mask.sum(dim=1)
         seq_idx = torch.cat([torch.full((s,), i, dtype=torch.int32) for i, s in enumerate(seqlens)], dim=0).unsqueeze(0)
         
         utr5_mask = (modality_type_tensors == self.modality_map["utr_5"]).to(torch.long)
-        utr3_mask = (modality_type_tensors == self.modality_map["utr_3"]).to(torch.long)
-        cds_mask = (modality_type_tensors == self.modality_map["cds"]).to(torch.long)
-        modality_mask = utr5_mask + utr3_mask + cds_mask
-        # print statistics
+        modality_mask = utr5_mask
         
         return {
             "labels": labels,
@@ -637,21 +600,76 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             "seq_idx": seq_idx,
             "species_ids": species_tensors,
             "utr5_mask": utr5_mask,
-            "utr3_mask": utr3_mask,
-            "cds_mask": cds_mask,
             "modality_mask": modality_mask,
-            "special_token_mask": special_token_mask
-            # "overall_kmer_utr5": overall_kmer_utr5,
-            # "overall_kmer_utr3": overall_kmer_utr3,
-            # "batch_kmer_utr5": batch_kmer_utr5,
-            # "batch_kmer_utr3": batch_kmer_utr3,
         }
 
 
-class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
+
+
+# from typing import Tuple, Sequence, Union
+class DPOUTR5SpeciesSpecificJointSequenceBatchConverter(object):
+    """Callable to convert an unprocessed (labels + strings) batch to a
+    processed (labels + tensor) batch.
+    """
+
+    def __init__(
+            self, 
+            global_alphabet,
+            utr_alphabet, 
+            codon_alphabet, 
+            protein_tokenizer,
+            max_length=None,
+            random_validation=None,
+            species_list=['Homo sapiens']
+        ):
+        self.global_tokenizer = global_alphabet
+        self.utr_5_tokenizer = utr_alphabet
+        self.codon_tokenizer = codon_alphabet
+        self.utr_3_tokenizer = utr_alphabet
+        self.protein_tokenizer = protein_tokenizer
+        self.modality_map = modality_map
+        self.number_of_modalities = len(self.modality_map.keys())
+        self.max_length = max_length
+        self.random_validation = random_validation
+        self.species_list = species_list
+        self.utr_converter = UTRSpeciesSpecificJointSequenceBatchConverter(
+            global_alphabet,
+            utr_alphabet, 
+            codon_alphabet, 
+            protein_tokenizer,
+            max_length=max_length,
+            random_validation=random_validation,
+            species_list=species_list,
+        )
+
+    def __call__(
+            self, 
+            raw_batch: Sequence,
+        ):
+        
+        raw_batch_chosen = [
+            (seq_id, protein_sequence, utr5_sequence_chosen, species)  \
+            for seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species in raw_batch
+            ]
+    
+        raw_batch_rejected = [
+            (seq_id, protein_sequence, utr5_sequence_rejected, species)  \
+            for seq_id, protein_sequence, utr5_sequence_chosen, utr5_sequence_rejected, species in raw_batch
+            ]
+        batch_chosen = self.utr_converter(raw_batch_chosen)
+        batch_rejected = self.utr_converter(raw_batch_rejected)
+        return {
+            "chosen": batch_chosen,
+            "rejected": batch_rejected,
+        }
+        
+
+
+class DPOUTR5SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
     def __init__(
             self, 
             lmdb_path: str, 
+            preference_data_path: str,
             metadata_path: str,
             training_key_list_file: Optional[str] = None,
             validation_key_list_file: Optional[str] = None,
@@ -664,14 +682,16 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
             work_dir: Union[str, Path] = Path().cwd(),
             overwrite: bool = False,
             protein_tokenizer=None,
-            random_validation=None
+            random_validation=None,
+            dataset_size_multiplier: float = 4.0,
         ):
         super().__init__()
         self.lmdb_path = lmdb_path
+        self.preference_data_path = preference_data_path
+        # self.validation_split = validation_split
         self.training_key_list_file = training_key_list_file
         self.validation_key_list_file = validation_key_list_file
         self.test_key_list_file = test_key_list_file
-        # self.validation_split = validation_split
         if batch_size is None and tokens_per_batch is None:
             raise ValueError("either batch_size or tokens_per_batch must be specified")
         elif tokens_per_batch is not None:
@@ -703,7 +723,7 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
         self.species_list = list(set(metadata.values()))
         self.species_list.append("Unknown")
         self.species_list.sort()
-        self.batch_converter = SpeciesSpecificJointSequenceBatchConverter(
+        self.batch_converter = DPOUTR5SpeciesSpecificJointSequenceBatchConverter(
             global_alphabet=self.global_tokenizer,
             utr_alphabet=self.utr_alphabet,
             codon_alphabet=self.codon_alphabet, 
@@ -711,8 +731,18 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
             random_validation=random_validation,
             species_list=self.species_list
         )
+        self.ce_batch_converter = SpeciesSpecificJointSequenceBatchConverter(
+            global_alphabet=self.global_tokenizer,
+            utr_alphabet=self.utr_alphabet,
+            codon_alphabet=self.codon_alphabet, 
+            protein_tokenizer=self.protein_tokenizer,
+            random_validation=random_validation,
+            species_list=self.species_list
+        )
+        self.dataset_size_multiplier = dataset_size_multiplier
 
     def setup(self, stage: Optional[str] = None):      
+        
         if os.path.exists(self.training_key_list_file) and \
             os.path.exists(self.validation_key_list_file) and \
                 not self.overwrite:
@@ -733,31 +763,54 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
         # Assign train/val datasets for use in dataloaders
         self.training_key_list = training_key_list
         self.validation_key_list = validation_key_list
+        
         if stage == "fit" or stage == "validate" or stage is None:
-            self.training_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=training_key_list)
-            self.validation_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=validation_key_list)
+            # preference dataset
+            self.training_dataset = DPOUTR5SpeciesSpecificJointSequenceSequenceDataset(self.preference_data_path, self.metadata_path, mode='train', dataset_size_multiplier=self.dataset_size_multiplier)
+            self.validation_dataset = DPOUTR5SpeciesSpecificJointSequenceSequenceDataset(self.preference_data_path, self.metadata_path, mode='val', dataset_size_multiplier=self.dataset_size_multiplier)
+            # ce dataset from lmdb
+            self.ce_training_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=training_key_list)
+            self.ce_validation_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=validation_key_list)
             if self.sequence_length_file is not None:
-                self.training_dataset.register_sequence_length(sequence_length)
-                self.validation_dataset.register_sequence_length(sequence_length)
+                self.ce_training_dataset.register_sequence_length(sequence_length)
+                self.ce_validation_dataset.register_sequence_length(sequence_length)
         
         if stage == "test":
-            test_key_list = read_compressed_msgpack(self.test_key_list_file)
-            self.test_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=test_key_list)
-            if self.sequence_length_file is not None:
-                self.test_dataset.register_sequence_length(sequence_length)
+            self.test_dataset = DPOUTR5SpeciesSpecificJointSequenceSequenceDataset(self.preference_data_path, self.metadata_path, mode='test', dataset_size_multiplier=1.0)
 
     def train_dataloader(self):
-        data_loader = self.get_dataloader(self.training_dataset)
-        if self.trainer is not None and self.trainer.model.module.resumed_dataloader_state_from_ckpt is not None:
-            print("Resuming dataloader state from checkpoint...")
-            data_loader.batch_sampler.load_state_dict(self.trainer.model.module.resumed_dataloader_state_from_ckpt)
-            self.trainer.model.module.resumed_dataloader_state_from_ckpt = None
-        return data_loader
+        preference_data_loader = self.get_dataloader(self.training_dataset)
+        ce_data_loader = self.get_ce_dataloader(self.ce_training_dataset)
+        # if self.trainer is not None and self.trainer.model.module.resumed_dataloader_state_from_ckpt is not None:
+        #     print("Resuming dataloader state from checkpoint...")
+        #     data_loader.batch_sampler.load_state_dict(self.trainer.model.module.resumed_dataloader_state_from_ckpt)
+        #     self.trainer.model.module.resumed_dataloader_state_from_ckpt = None
+        
+        loaders = {"dpo": preference_data_loader, "ce": ce_data_loader}
+        combined = CombinedLoader(loaders, mode="min_size")  # cycles the smaller
+        return combined
+        
 
     def val_dataloader(self):
-        return self.get_dataloader(self.validation_dataset)
+        preference_data_loader = self.get_dataloader(self.validation_dataset)
+        ce_data_loader = self.get_ce_dataloader(self.ce_validation_dataset)
+        loaders = {"dpo": preference_data_loader, "ce": ce_data_loader}
+        combined = CombinedLoader(loaders, mode="min_size")  # cycles the smaller
+        return combined
     
     def get_dataloader(self, dataset):
+        
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            collate_fn=self.batch_converter,
+            pin_memory=True,
+            drop_last=True
+        )
+    
+    def get_ce_dataloader(self, dataset):
         if self.toks_per_batch is None:
             distributed_bucket_sampler = DistributedSequenceBucketBatchSampler(
                 dataset, batch_size=self.batch_size,
@@ -767,7 +820,7 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
                 distributed_bucket_sampler.set_epoch(self.trainer.current_epoch)
             return DataLoaderWrapper(dataset, 
                             shuffle=False, 
-                            collate_fn=self.batch_converter,
+                            collate_fn=self.ce_batch_converter,
                             num_workers=self.num_workers,
                             batch_sampler=distributed_bucket_sampler,
                             pin_memory=True,
@@ -787,14 +840,13 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
                 distributed_bucket_sampler.set_epoch(self.trainer.current_epoch)
             return DataLoaderWrapper(dataset, 
                             shuffle=False, 
-                            collate_fn=self.batch_converter,
+                            collate_fn=self.ce_batch_converter,
                             num_workers=self.num_workers,
                             batch_sampler=distributed_bucket_sampler,
                             pin_memory=True,
                             prefetch_factor=2
                             # drop_last=True
                     )
-           
 
 def prepare_protein_inputs_for_model(
         protein_sequence,

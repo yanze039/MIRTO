@@ -144,7 +144,7 @@ class Alphabet(object):
         return idx
 
     def get_tok(self, ind):
-        return self.idx_to_tok.get(ind, None)
+        return self.idx_to_tok.get(ind, "-")
 
     def to_dict(self):
         return {"toks": self.all_toks}
@@ -212,6 +212,9 @@ class Alphabet(object):
                 #     continue
                 # if idx == self.eos_idx:
                 #     break
+                token = self.get_tok(idx)
+                if token is None:
+                    print(f"Warning: idx {idx} not found in idx_to_tok mapping.")
                 decoded_sample.append(self.get_tok(idx))
             decoded_samples.append("".join(decoded_sample))
         return decoded_samples
@@ -726,6 +729,10 @@ class DecodingController:
             # it means we are processing prompt
             # so we only take the last token
             tokens = tokens[:, -1]  
+            # it also means we already in the middle of decoding
+            # so we initialize the status based on previous status
+            self.status = torch.zeros(tokens.shape[0], dtype=torch.int64, device=tokens.device) + \
+                self.decoding_stage_table["UTR_5"]
         tokens = tokens.squeeze(1) if tokens.dim() == 2 else tokens
         self.status = torch.where(
             tokens == self.global_tokenizer.get_idx("<utr_5_bos>"),
@@ -844,7 +851,7 @@ class DecodingController:
         tokens.append(self.utr_alphabet.get_idx("U"))
         tokens.append(self.utr_alphabet.get_idx("C"))
         tokens.append(self.utr_alphabet.get_idx("G"))
-        tokens.append(self.utr_alphabet.get_idx("I"))
+        # tokens.append(self.utr_alphabet.get_idx("I"))
         return tokens
     
     def _get_cds_start_token_idx(self):
@@ -870,7 +877,7 @@ class DecodingController:
         tokens.append(self.utr_alphabet.get_idx("U"))
         tokens.append(self.utr_alphabet.get_idx("C"))
         tokens.append(self.utr_alphabet.get_idx("G"))
-        tokens.append(self.utr_alphabet.get_idx("I"))
+        # tokens.append(self.utr_alphabet.get_idx("I"))
         return tokens
     
 

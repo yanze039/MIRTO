@@ -4,7 +4,7 @@ import gc
 from typing import Callable, Optional, Sequence, Union
 import tqdm
 import torch
-from flash_attn.utils.generation import (
+from .utils import (
     InferenceParams
 )
 from jsm.data.utils import DecodingController
@@ -33,7 +33,11 @@ def decode(
     progress_bar=True,
     cuda_monitor=False,
     expected_utr_5_length=None,
-    expected_utr_3_length=None
+    expected_utr_3_length=None,
+    steering_vector=None,
+    steering_layer_index=None,
+    steering_weight=1.0,
+    utr5_only=False,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -51,6 +55,7 @@ def decode(
         scores: tuples of (batch, vocab_size)
     """
     batch_size, seqlen_og = input_ids.shape
+    batch_steering_vector = steering_vector.repeat(batch_size, 1) if steering_vector is not None else None
     if cg:
         if not hasattr(model, "_decoding_cache"):
             model._decoding_cache = None
@@ -61,11 +66,14 @@ def decode(
             seqlen_og,
             max_length,
             tensor_parallel=tensor_parallel,
+            steering_vector=batch_steering_vector,
+            steering_layer_index=steering_layer_index,
+            steering_weight=steering_weight,
         )
         inference_params = model._decoding_cache.inference_params
         inference_params.reset(max_length, batch_size)
     else:
-        inference_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
+        inference_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size, steering_vector=batch_steering_vector, steering_layer_index=steering_layer_index, steering_weight=steering_weight)
 
     def get_logits(input_ids, inference_params):
         decoding = inference_params.seqlen_offset > 0
@@ -83,7 +91,8 @@ def decode(
             if cg:
                 logits = model._decoding_cache.run(
                     input_ids, 
-                    inference_params.seqlen_offset
+                    inference_params.seqlen_offset,
+                    inference_params.steering
                 ).squeeze(dim=1)
             else:
                 logits = model.generating_forward(
@@ -128,6 +137,8 @@ def decode(
     controller.update(input_ids)
     
     while not controller.should_stop():
+        utr5_mask = (controller.status == controller.decoding_stage_table['UTR_5'])
+        inference_params.steering.copy_(utr5_mask)
         logits = get_logits(controller.sequences[-1], inference_params)
         inference_params.seqlen_offset += controller.sequences[-1].shape[1]
         modified_logits = controller.modify_logits(logits)
@@ -138,6 +149,7 @@ def decode(
         controller.update(sampled_tokens)
         metrics.update(modified_logits, sampled_tokens.squeeze(1))
         pbar.update(controller.sequences[-1].shape[1]) if pbar is not None else None
+        
     if enable_timing:
         end.record()
         if tensor_parallel > 1:
@@ -200,6 +212,9 @@ def update_graph_cache(
     tensor_parallel=1,
     dtype=None,
     n_warmups=2,
+    steering_vector=None,
+    steering_layer_index=None,
+    steering_weight=1.0,
 ):
     if cache is None:
         cache = DecodingCGCache()
@@ -227,6 +242,17 @@ def update_graph_cache(
             seqlen_offset=seqlen_og,
             key_value_memory_dict=inf_cache,
             lengths_per_sample=lengths_per_sample,
+            steering_vector=steering_vector,
+            steering_layer_index=steering_layer_index,
+            steering_weight=steering_weight,
+        )
+        cache.inference_params.steering = torch.zeros(
+            (batch_size,), device=device, dtype=torch.bool
+        )
+        cache.inference_params.debug_counter = torch.zeros(
+            (),  # scalar
+            device=device,
+            dtype=torch.int32,
         )
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
     for decoding_seqlen in decoding_seqlens:
@@ -239,11 +265,14 @@ def update_graph_cache(
                 decoding_seqlen=decoding_seqlen,
                 mempool=cache.mempool,
                 n_warmups=n_warmups,
+                steering_vector=steering_vector,
+                steering_layer_index=steering_layer_index,
+                steering_weight=steering_weight,
             )
 
-    def dispatch(input_ids, seqlen):
+    def dispatch(input_ids, seqlen, steering_mask):
         batch_size, decoding_seqlen = input_ids.shape[:2]
-        return cache.callables[batch_size, decoding_seqlen](input_ids, seqlen)
+        return cache.callables[batch_size, decoding_seqlen](input_ids, seqlen, steering_mask)
 
     cache.run = dispatch
     cache.inference_params.seqlen_offset = 0  # Reset so it's not confusing
@@ -257,13 +286,21 @@ def capture_graph(
     max_seqlen, 
     decoding_seqlen=1, 
     mempool=None, 
-    n_warmups=2
+    n_warmups=2,
+    steering_vector=None,
+    steering_layer_index=None,
+    steering_weight=1.0,
 ):
     device = next(iter(model.parameters())).device
     input_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
     seqlen_offset_og = inference_params.seqlen_offset
     inference_params.seqlen_offset = max_seqlen - decoding_seqlen
     inference_params.lengths_per_sample[:] = inference_params.seqlen_offset
+    inference_params.steering_vector = steering_vector
+    inference_params.steering_layer_index = steering_layer_index
+    inference_params.steering_weight = steering_weight
+    inference_params.steering.fill_(False)  # or False; just don't reassign
+    inference_params.debug_counter.zero_()
 
     # Warmup before capture
     s = torch.cuda.Stream()
@@ -295,8 +332,9 @@ def capture_graph(
             return_hidden_states=False
         )
 
-    def run(new_input_ids, seqlen):
+    def run(new_input_ids, seqlen, steering_mask):
         inference_params.lengths_per_sample[:] = seqlen
+        inference_params.steering.copy_(steering_mask)
         input_ids.copy_(new_input_ids)
         graph.replay()
         return logits.clone()

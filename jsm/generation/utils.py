@@ -7,6 +7,33 @@ from mamba_ssm.utils.generation import (
 from dataclasses import dataclass, field
 from transformers.utils import ModelOutput
 from typing import Optional, Callable
+from torch import Tensor
+
+
+@dataclass
+class InferenceParams:
+    """Inference parameters that are passed to the main model in order
+    to efficienly calculate and store the context during inference."""
+
+    max_seqlen: int
+    max_batch_size: int
+    seqlen_offset: int = 0
+    batch_size_offset: int = 0
+    key_value_memory_dict: dict = field(default_factory=dict)
+    lengths_per_sample: Optional[Tensor] = None
+    steering: Optional[Tensor] = None
+    steering_vector: Optional[Tensor] = None
+    steering_layer_index: Optional[int] = None
+    steering_weight: float = 1.0
+    debug_counter: torch.Tensor = field(default_factory=lambda: torch.zeros((), dtype=torch.int32))
+
+    def reset(self, max_seqlen, max_batch_size):
+        self.max_seqlen = max_seqlen
+        self.max_batch_size = max_batch_size
+        self.seqlen_offset = 0
+        if self.lengths_per_sample is not None:
+            self.lengths_per_sample.zero_()
+
 
 @dataclass
 class DecodingCGCache:

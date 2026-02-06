@@ -1,0 +1,8 @@
+name: ncrna
+type: transformer
+hidden_size: 512
+n_blocks: 12
+n_heads: 8
+protein_hidden_size: 960
+num_species: 256
+

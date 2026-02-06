@@ -647,19 +647,30 @@ def prepare_inputs_for_model(
             prompt_token = global_tokenizer.cls_idx
             prompt_input_ids = torch.tensor([prompt_token], device=protein_embeddings.device, dtype=torch.int64).view(1, 1)
         elif isinstance(prompt, str):
-            prompt_input_ids, protein_embeddings = tokenize_inputs(
+            # prompt_input_ids, protein_embeddings = tokenize_inputs(
+            #     protein_sequence, 
+            #     utr5_sequence=prompt,
+            #     cds_sequence=None,
+            #     utr3_sequence=None,
+            #     protein_tokenizer=protein_tokenizer,
+            #     protein_encoder=protein_encoder,
+            #     global_tokenizer=global_tokenizer,
+            #     codon_tokenizer=codon_tokenizer,
+            #     utr_5_tokenizer=utr_5_tokenizer,
+            #     utr_3_tokenizer=None,
+            #     complete_sequence=False
+            # )
+            
+            
+            prompt_input_ids, protein_embeddings = tokenize_prompt(
                 protein_sequence, 
-                utr5_sequence=prompt,
-                cds_sequence=None,
-                utr3_sequence=None,
+                prompt_sequence=prompt,
                 protein_tokenizer=protein_tokenizer,
                 protein_encoder=protein_encoder,
                 global_tokenizer=global_tokenizer,
-                codon_tokenizer=codon_tokenizer,
                 utr_5_tokenizer=utr_5_tokenizer,
-                utr_3_tokenizer=None,
-                complete_sequence=False
             )
+            
             protein_embeddings = protein_embeddings.repeat(batch_size, 1, 1)
         else:
             raise ValueError("prompt must be a string or None.")
@@ -765,6 +776,46 @@ def tokenize_inputs(
     # global eos
     if complete_sequence:
         tokens[0, tokenized_length-1] = global_tokenizer.eos_idx
+    tokens = tokens.long().to(protein_embeddings.device)
+    return tokens, protein_embeddings
+
+
+def tokenize_prompt(
+        protein_sequence, 
+        prompt_sequence=None,
+        protein_tokenizer=None,
+        protein_encoder=None,
+        global_tokenizer=None,
+        utr_5_tokenizer=None,
+    ):
+    protein_embeddings = prepare_protein_inputs_for_model(
+        protein_sequence,
+        protein_tokenizer,
+        protein_encoder,
+        batch_size=1,
+    )
+    
+    tokenized_length = 1  # for <cls> token
+    tokenized_length += len(prompt_sequence) + 1
+
+    tokens = torch.zeros((1, tokenized_length), device=protein_embeddings.device)
+
+    tokens[0, 0] = global_tokenizer.cls_idx
+    
+    prompt_sequence = _handle_special_nucleotides(prompt_sequence, max_length=-1, replace_T=True)
+    # >>> 5' UTR Section <<<
+    prompt_tensor = torch.tensor(
+        [utr_5_tokenizer.get_idx(prompt_sequence[i]) for i in range(0, len(prompt_sequence))], dtype=torch.int64
+    )
+    tokens[
+        0,
+        1,
+    ] = global_tokenizer.get_idx("<utr_5_bos>")
+    tokens[
+        0,
+        2 : 2 + len(prompt_tensor),
+    ] = prompt_tensor
+
     tokens = tokens.long().to(protein_embeddings.device)
     return tokens, protein_embeddings
 

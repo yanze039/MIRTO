@@ -1,0 +1,18 @@
+name: dpo
+datamodule:
+  _target_: jsm.data.dpo.DPOUTR5SpeciesSpecificJointSequenceDataModule
+  num_workers: 4
+  preference_data_path: /orcd/home/002/yanze039/orcd/pool/RNA_design/outputs_joint_sequence/13.construct_contrastive_dataset/training_data/round2_0129/contrastive_data_utr5_with_sequences_from_dpo_0125.csv
+  metadata_path: /home/yanze039/orcd/scratch/data/data/RefSeq/all_metadata.msgpack.zst
+  lmdb_path: /home/yanze039/orcd/scratch/data/data/RefSeq/valid_sequence_pair.lmdb
+  training_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq/remove_homology_protein/revised_train_keys.msgpack.zst
+  validation_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq/remove_homology_protein/revised_valid_keys.msgpack.zst
+  test_key_list_file: /home/yanze039/orcd/scratch/data/data/RefSeq/remove_homology_protein/revised_test_keys.msgpack.zst
+  sequence_length_file: /home/yanze039/orcd/scratch/data/data/RefSeq/valid_sequence_pair.lengths.msgpack.zst
+  batch_size: null
+  # validation_split: 0.0005
+  tokens_per_batch: null
+  work_dir: /home/yanze039/orcd/scratch/data/data/RefSeq/training
+  overwrite: false
+  random_validation: null
+  dataset_size_multiplier: 4.0
