@@ -204,18 +204,18 @@ class JointSequenceDiffusion(Diffusion):
         # token_nll = batch_nll / count
         
         # utr5 nlls
-        utr5_nlls = nlls * batch['utr5_mask']
-        utr5_count = batch['utr5_mask'].sum(dim=-1, keepdim=True)
+        utr5_nlls = (nlls * batch['utr5_mask']).sum(dim=-1)
+        utr5_count = batch['utr5_mask'].sum(dim=-1)
         utr5_token_nll = (utr5_nlls / utr5_count).mean()
         
         # codon nlls
-        cds_nlls = nlls * batch['cds_mask']
-        cds_count = batch['cds_mask'].sum(dim=-1, keepdim=True)
+        cds_nlls = (nlls * batch['cds_mask']).sum(dim=-1)
+        cds_count = batch['cds_mask'].sum(dim=-1)
         cds_token_nll = (cds_nlls / cds_count).mean()
         
         # utr3 nlls
-        utr3_nlls = nlls * batch['utr3_mask']
-        utr3_count = batch['utr3_mask'].sum(dim=-1, keepdim=True)
+        utr3_nlls = (nlls * batch['utr3_mask']).sum(dim=-1)
+        utr3_count = batch['utr3_mask'].sum(dim=-1)
         utr3_token_nll = (utr3_nlls / utr3_count).mean()
         
         mean_token_nll = (utr5_token_nll + cds_token_nll + utr3_token_nll) / 3.0
