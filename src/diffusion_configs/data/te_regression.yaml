@@ -1,0 +1,11 @@
+name: te_regression
+datamodule:
+  _target_: jsm.data.te_regression.TESpeciesSpecificJointSequenceDataModule
+  num_workers: 4
+  # Renamed in refactor: was `te_data_path`.
+  data_path: /orcd/home/002/yanze039/orcd/pool/RNA_design/data/predictors/te_cleaned.parquet
+  metadata_path: /home/yanze039/orcd/scratch/data/data/RefSeq/all_metadata.msgpack.zst
+  batch_size: 8
+  work_dir: /home/yanze039/orcd/scratch/data/data/RefSeq/training
+  overwrite: true
+  random_validation: null

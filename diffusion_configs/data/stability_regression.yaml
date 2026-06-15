@@ -1,0 +1,10 @@
+name: stability_regression
+datamodule:
+  _target_: jsm.data.stability_regression.StabilitySpeciesSpecificJointSequenceDataModule
+  num_workers: 4
+  stability_data_path: /orcd/home/002/yanze039/orcd/pool/RNA_design/data/predictors/stability_cleaned.parquet
+  metadata_path: /home/yanze039/orcd/scratch/data/data/RefSeq/all_metadata.msgpack.zst
+  batch_size: 8
+  work_dir: /home/yanze039/orcd/scratch/data/data/RefSeq/training
+  overwrite: true
+  random_validation: null

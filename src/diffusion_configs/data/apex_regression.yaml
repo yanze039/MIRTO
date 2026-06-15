@@ -1,0 +1,11 @@
+name: apex_regression
+datamodule:
+  _target_: jsm.data.apex_regression.APEXSpeciesSpecificJointSequenceDataModule
+  num_workers: 4
+  # Renamed in refactor: was `apex_data_path`. Parametric base uses `data_path`.
+  data_path: /orcd/home/002/yanze039/orcd/pool/RNA_design/data/predictors/apexseq_rna_loc_cleaned.parquet
+  metadata_path: /home/yanze039/orcd/scratch/data/data/RefSeq/all_metadata.msgpack.zst
+  batch_size: 8
+  work_dir: /home/yanze039/orcd/scratch/data/data/RefSeq/training
+  overwrite: true
+  random_validation: null

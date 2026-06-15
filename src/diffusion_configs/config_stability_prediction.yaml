@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor, progress_bar]
-  - /data: species_specific
+  - /data: stability_regression
   - /model: transformer_300M
   - /strategy: ddp
   - /noise: loglinear
@@ -15,6 +15,15 @@ T: 0  # 0 (continuous time) / 1000
 subs_masking: False
 
 seed: 1
+
+prediction:
+  freeze_backbone: True
+  num_heads: 5
+  expansion: 1
+  dropout: 0.00
+  layer_index: 13
+  output_dim: 1
+  label_names: ['normalized_half_life']
 
 sampling:
   predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
@@ -46,8 +55,8 @@ eval:
   generate_samples: True
 
 optim:
-  weight_decay: 0.01
-  lr: 0.0003
+  weight_decay: 0.001
+  lr: 0.005
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -59,7 +68,7 @@ trainer:
   accelerator: "auto"
   num_nodes: 1
   # devices: ${device_count:}
-  devices: 8
+  devices: 1
   # accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   accumulate_grad_batches: 1
   gradient_clip_val: 0.5
@@ -71,7 +80,7 @@ trainer:
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
   use_distributed_sampler: false
-  val_check_interval: 0.2
+  val_check_interval: 1.0
   enable_checkpointing: true
   enable_progress_bar: true
 

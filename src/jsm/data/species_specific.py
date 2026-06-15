@@ -354,14 +354,12 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         self.max_length = max_length
         self.random_validation = random_validation
         self.species_list = species_list
-        # self.k_per_seq = 5
-        # self.reference_kmer_utr5 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_5_kmers_{self.k_per_seq}_human.csv"
-        # self.reference_kmer_utr3 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_3_kmers_{self.k_per_seq}_human.csv"
-        # self.human_kmer_utr5 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr5, self.k_per_seq)
-        # self.human_kmer_utr3 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr3, self.k_per_seq)
-        # self.pseudo_kmer_alpha = 0.05  # weight for human kmer pseudocounts
+        # NOTE (refactor): commented-out hardcoded user-local k-mer paths
+        # removed here. If you need to bring back k-mer pseudocount support,
+        # add k_per_seq / reference_kmer_utr5 / reference_kmer_utr3 as
+        # constructor kwargs sourced from the YAML, not hardcoded.
 
-        
+
 
     def __call__(self, 
                  raw_batch: Sequence,

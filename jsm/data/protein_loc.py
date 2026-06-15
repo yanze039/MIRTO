@@ -1,23 +1,22 @@
 import os
-import lmdb
 import random
 from typing import Optional, Union, Sequence
-import torch
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset
 import lightning.pytorch as pl
+import pandas as pd
 from pathlib import Path
 from .utils import (Alphabet, 
-                    DistributedSequenceBucketBatchSampler,
+                    nucleotide_label_combination_rules, 
+                    NoncanonicalNucleotideLabels,
+                    truncate,
                     modality_map,
                     DataLoaderWrapper,
-                    esm_tokenize,
-                    _handle_special_nucleotides
+                    esm_tokenize
                     )
 import msgpack
 import zstandard as zstd
-import numpy as np
 
 
 def is_main_process():
@@ -59,165 +58,93 @@ def save_compressed_msgpack(file_path, obj):
         fp.write(compressed)
     print(f"Saved compressed msgpack to {file_path}")
 
-class SpeciesSpecificJointSequenceLMDBSequenceDataset(Dataset):
+class ProteinLocJointSequenceDataset(Dataset):
     def __init__(
             self, 
-            lmdb_path,
+            data_file_path,
             metadata_path,
-            keys=None,
+            mode='train'
         ):
         """
         Initialize the LMDB dataset for direct retrieval.
-        :param lmdb_path: Path to the LMDB file
+        :param data_file_path: Path to the LMDB file
         :param keys: List of known keys (sequence IDs)
         """
-        self.lmdb_path = str(lmdb_path)
-        self.env = lmdb.open(self.lmdb_path, readonly=True, 
-                             lock=False, readahead=True, 
-                             meminit=False, subdir=False,
-                             map_size=200 * 1024 * 1024 * 1024)
-        # If keys are not provided, retrieve all keys from the LMDB file
-        if keys is None:
-            with self.env.begin() as txn:
-                self.keys = [key.decode("ascii") for key, _ in txn.cursor()]
+        assert mode in ['train', 'val', 'test'], "mode must be 'train', 'val' or 'test'"
+        self.data_file_path = Path(str(data_file_path))
+        if self.data_file_path.suffix == ".csv":
+            self.data = pd.read_csv(self.data_file_path)
+        elif self.data_file_path.suffix == ".parquet":
+            self.data = pd.read_parquet(self.data_file_path)
         else:
-            self.keys = keys  # Use the provided list of keys
-        self.txn = self.env.begin(write=False)
+            raise ValueError("data_file_path must be a csv or parquet file")
+        self.data = self.data[self.data['split'] == mode]
+        self.data['transcript_length'] = self.data['protein_sequence'].str.len() + \
+            self.data['utr5_sequence'].str.len() + self.data['cds_sequence'].str.len()//3 + \
+                self.data['utr3_sequence'].str.len() + 10
+        self.data = self.data[self.data['transcript_length'] < 8000]
+        
+        self.mode = mode
         self.decompressor = zstd.ZstdDecompressor()
         self.protein_max_length = 2048
         self.rna_max_length = 8000
         
         self.metadata_path = metadata_path
         self.metadata = read_compressed_msgpack(self.metadata_path)
+        self.metadata = {k.partition('.')[0]: v for k, v in self.metadata.items()}
+        loc_columns = ['Cytoplasm', 'Nucleus', 'Cell membrane']
+        self.loc_columns = loc_columns
+        self.data.rename(columns={"ENSG_id": "ensg_id"}, inplace=True)
+        self.data = self.data[["ensg_id", "utr5_sequence", "cds_sequence", 'best_refseq_mrna_id',
+                               "utr3_sequence", "protein_sequence"] + self.loc_columns]
+        self.keys = self.data['ensg_id'].unique().tolist()
+        self.data.drop_duplicates(subset=['ensg_id'], inplace=True)
+        self.keys = list(set(self.keys)) * (len(self.data) // len(set(self.keys)))
+        random.shuffle(self.keys)
+        self.data.set_index("ensg_id", inplace=True)
 
     def __len__(self):
         """Returns total number of stored sequences."""
         return len(self.keys)
 
     def __getitem__(self, idx):
-        
-        seq_id = self.keys[idx]  # Get the sequence ID
-        if not hasattr(self, "txn"):
-            self.txn = self.env.begin(write=False)
-
-        value = self.txn.get(seq_id.encode("ascii"))  # Retrieve sequence
-        if value is None:
-            raise KeyError(f"Sequence ID {seq_id} not found in LMDB")
-
-        # value = pickle.loads(value)  # Deserialize the sequence
-        value = msgpack.unpackb(self.decompressor.decompress(value), raw=False)  # raw=False for str instead of bytes
-        # replace T with U
-        protein_sequence = value[0]
-        utr5_sequence = value[1]
-        cds_sequence = value[2]
-        utr3_sequence = value[3]
-        species = self.metadata.get(seq_id, "Unknown")
-        return seq_id, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, species
-    
-    def close(self):
-        if hasattr(self, "txn"):
-            self.txn.abort()
-            del self.txn
-        if hasattr(self, "env"):
-            self.env.close()
-    
-    def register_sequence_length(self, 
-                            sequence_length: Optional[dict] = None
-                            ) -> None:
-        self.sequences_length = sequence_length
+        """Retrieves a sequence by its key."""
+        ensg_id = self.keys[idx]  # Get the sequence ID
+        row = self.data.loc[ensg_id]
+        protein_sequence = row['protein_sequence']
+        utr5_sequence = row['utr5_sequence']
+        cds_sequence = row['cds_sequence']
+        utr3_sequence = row['utr3_sequence']
+        refseq_id = row['best_refseq_mrna_id']
+        species = "Homo sapiens"
+        loc_vector = row[self.loc_columns].values.astype(int)
+        return refseq_id, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, loc_vector, species
     
 
-    def get_batch_indices(self, 
-                          toks_per_batch, 
-                          extra_toks_per_seq=8, 
-                          sort=True,
-                          shuffle_batch=False,
-                          consumed_key_indices=None
-                          ):
-        sizes = []
-        for i, kk in enumerate(self.keys):
-            sizes.append(
-                (
-                    min(self.sequences_length[kk][0], self.protein_max_length),
-                    min(self.sequences_length[kk][1]+self.sequences_length[kk][2]//3+self.sequences_length[kk][3], self.rna_max_length),
-                    i
-                )  # Ensure we do not exceed max_length
-            )
-        if len(sizes) == 0:
-            raise ValueError("No sequences left after skipping keys, please check your consumed_key_indices")
-        if sort:
-            sizes.sort(reverse=False, key=lambda x: (x[1]+x[0], x[1], x[0]))
-        batches = []
-        buf = []
-        max_len = 0
+def _handle_special_nucleotides(
+                            sequence, 
+                            max_length=2046,
+                            random_truncate=True,
+                            inverse_truncate=False,
+                            replace_T=True,
+                            ):
+    if max_length < 0:
+        sequence = sequence
+    elif len(sequence) > max_length:
+        sequence = truncate(sequence, max_length, random_truncate=random_truncate, inverse_truncate=inverse_truncate)
+    new_sequence = ""
+    sequence = sequence.strip().upper()
+    for char in sequence:
+        if char in NoncanonicalNucleotideLabels:
+            new_sequence += random.choice(nucleotide_label_combination_rules[char])
+        else:
+            new_sequence += char
+    if replace_T:
+        new_sequence = new_sequence.replace("T", "U")
+    else:
+        new_sequence = new_sequence.replace("U", "T")
+    return new_sequence
 
-        def _flush_current_buf():
-            nonlocal max_len, buf
-            if len(buf) == 0:
-                return
-            batches.append(buf)
-            buf = []
-            max_len = 0
-
-        for sz_protein, sz_rna, i in sizes:
-            sz = sz_protein + sz_rna
-            sz += extra_toks_per_seq
-            if max(sz, max_len) * (len(buf) + 1) > toks_per_batch:
-                _flush_current_buf()
-            max_len = max(max_len, sz)
-            buf.append(i)
-
-        _flush_current_buf()
-        if shuffle_batch:
-            random.shuffle(batches)
-        return batches
-    
-    def get_batch_indices_by_count(self, 
-                          batch_size, 
-                          extra_toks_per_seq=8, 
-                          sort=True,
-                          shuffle_batch=False,
-                          consumed_key_indices=None
-                          ):
-        sizes = []
-        # (min(self.sequences_length[kk], self.max_length), i) for i, kk in enumerate(self.keys)
-        for i, kk in enumerate(self.keys):
-            sizes.append(
-                (
-                    min(self.sequences_length[kk][0], self.protein_max_length),
-                    min(self.sequences_length[kk][1]+self.sequences_length[kk][2]//3+self.sequences_length[kk][3], self.rna_max_length),
-                    i
-                )  # Ensure we do not exceed max_length
-            )
-        if len(sizes) == 0:
-            raise ValueError("No sequences left after skipping keys, please check your consumed_key_indices")
-        if sort:
-            sizes.sort(reverse=False, key=lambda x: (x[1], x[0]))
-        batches = []
-        buf = []
-        count = 0
-
-        def _flush_current_buf():
-            nonlocal buf, count
-            if len(buf) == 0:
-                return
-            batches.append(buf)
-            buf = []
-            count = 0
-
-        for sz_protein, sz_rna, i in sizes:
-            if count >= batch_size:
-                _flush_current_buf()
-            buf.append(i)
-            count += 1
-        
-        if len(buf) > 0 and len(buf) < batch_size:
-            for kk in range(batch_size-len(buf)):
-                buf.append(random.randint(0, len(sizes)))
-        _flush_current_buf()
-        if shuffle_batch:
-            random.shuffle(batches)
-        return batches
 
 def generate_random_sequence(sequence_length):
     nas = ""
@@ -226,110 +153,7 @@ def generate_random_sequence(sequence_length):
     return nas
 
 
-
-
-BASE_ORDER = ["A", "C", "G", "U"]
-BASE_TO_ID = {b: i for i, b in enumerate(BASE_ORDER)}
-BASE_MAP = np.full(256, -1, dtype=np.int16)
-BASE_MAP[ord('A')] = 0
-BASE_MAP[ord('C')] = 1
-BASE_MAP[ord('G')] = 2
-BASE_MAP[ord('U')] = 3
-BASE_MAP[ord('T')] = 3  # if your sequences sometimes use T
-
-def kmer_counts_from_text(seq: str, k: int, counts: np.ndarray, mask: np.ndarray | None = None):
-    """
-    Update `counts` (shape [4**k]) in place with k-mer counts from `seq`.
-    - seq: raw string of A/C/G/U (T allowed -> treated as U)
-    - mask: optional bool array of shape [len(seq)], True = include this position.
-            A window is counted only if ALL k positions are True and valid bases.
-    """
-    s = seq.upper().encode("ascii", "ignore")
-    x = BASE_MAP[np.frombuffer(s, dtype=np.uint8)]  # [-1,0,1,2,3], shape [L]
-    L = x.shape[0]
-    T = L - k + 1
-    if T <= 0:
-        return
-
-    valid = (x >= 0)
-    if mask is not None:
-        # mask could exclude separators / special region boundaries etc.
-        valid = valid & mask.astype(bool)
-
-    # window valid if all k positions valid
-    # compute via convolution-like sliding AND (vectorized)
-    # (small k, so this is fine)
-    win_ok = valid[:T].copy()
-    for i in range(1, k):
-        win_ok &= valid[i:i+T]
-
-    if not win_ok.any():
-        return
-
-    # rolling base-4 code: code[t] = sum_{i=0..k-1} x[t+i] * 4^(k-1-i)
-    weights = (4 ** np.arange(k-1, -1, -1, dtype=np.int64))  # [k]
-    # build codes vectorized using dot over a strided view
-    # shape: [T, k]
-    Xw = np.lib.stride_tricks.as_strided(
-        x,
-        shape=(T, k),
-        strides=(x.strides[0], x.strides[0]),
-        writeable=False
-    ).astype(np.int64)
-
-    codes = (Xw * weights).sum(axis=1)  # [T]
-    codes = codes[win_ok]
-    np.add.at(counts, codes, 1)
-
-
-def kmer_to_index(kmer: str) -> int:
-    """
-    Convert k-mer string (ACGU only) to base-4 index.
-    Order matches lexicographic BASE_ORDER.
-    """
-    idx = 0
-    for c in kmer:
-        idx = idx * 4 + BASE_TO_ID[c]
-    return idx
-
-import pandas as pd
-
-def load_kmer_pseudocount_from_csv(
-    csv_path: str,
-    k: int,
-    dtype=np.float64,
-    normalize: bool = True,
-):
-    """
-    Returns:
-      pseudo: np.ndarray shape [4**k]
-    """
-    df = pd.read_csv(csv_path)   # columns: [kmer, count]
-    df.columns = ["kmer", "count"]
-
-    M = 4 ** k
-    pseudo = np.zeros(M, dtype=dtype)
-
-    for kmer, cnt in zip(df["kmer"], df["count"]):
-        # defensively handle DNA
-        kmer = kmer.replace("T", "U")
-        if len(kmer) != k:
-            continue
-        try:
-            idx = kmer_to_index(kmer)
-            pseudo[idx] += cnt
-        except KeyError:
-            # skip kmers with non-ACGU chars
-            continue
-
-    if normalize:
-        pseudo = pseudo / pseudo.sum()
-
-    return pseudo
-
-
-# from typing import Tuple, Sequence, Union
-class SpeciesSpecificJointSequenceBatchConverter(object):
+class ProteinLocSpeciesSpecificJointSequenceBatchConverter(object):
     """Callable to convert an unprocessed (labels + strings) batch to a
     processed (labels + tensor) batch.
     """
@@ -354,25 +178,14 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         self.max_length = max_length
         self.random_validation = random_validation
         self.species_list = species_list
-        # self.k_per_seq = 5
-        # self.reference_kmer_utr5 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_5_kmers_{self.k_per_seq}_human.csv"
-        # self.reference_kmer_utr3 = f"/home/yanze039/orcd/scratch/data/data/RefSeq_hsapiens/kmers/utr_3_kmers_{self.k_per_seq}_human.csv"
-        # self.human_kmer_utr5 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr5, self.k_per_seq)
-        # self.human_kmer_utr3 = load_kmer_pseudocount_from_csv(self.reference_kmer_utr3, self.k_per_seq)
-        # self.pseudo_kmer_alpha = 0.05  # weight for human kmer pseudocounts
-
         
 
     def __call__(self, 
                  raw_batch: Sequence,
                  ):
-        # if self.nested_tensor:
-            # return self.convert_nested_tensor_batch(raw_batch)
-        # RoBERTa uses an eos token, while ESM-1 does not.
         batch_size = len(raw_batch)
         max_len = max((len(utr5_sequence) + len(cds_sequence)//3 + len(utr3_sequence)) \
-                    for _, _, utr5_sequence, cds_sequence, utr3_sequence, _ in raw_batch)
-        # seq_id, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence
+                    for refseq_id, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, loc_vector, species in raw_batch)
         tokens = torch.empty(
             (
                 batch_size,
@@ -399,26 +212,15 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         labels = []
         
         all_protein_sequence = []
-        # M = 4 ** self.k_per_seq
-        # overall_counts_utr5 = np.zeros(M, dtype=np.float64)
-        # batch_counts_utr5 = np.zeros((len(raw_batch), M), dtype=np.float64)
-        # overall_counts_utr3 = np.zeros(M, dtype=np.float64)
-        # batch_counts_utr3 = np.zeros((len(raw_batch), M), dtype=np.float64)
-
-        for batch_idx, (label, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, species ) in enumerate(raw_batch):
+        loc_tensors = torch.empty((batch_size, 3), dtype=torch.int64)
+        
+        for batch_idx, (refseq_id, protein_sequence, utr5_sequence, cds_sequence, utr3_sequence, loc_vector, species ) in enumerate(raw_batch):
+            
+            loc_tensors[batch_idx] = torch.tensor(loc_vector, dtype=torch.int64)
+            
             cds_sequence = _handle_special_nucleotides(cds_sequence, max_length=-1, replace_T=False)
             utr5_sequence = _handle_special_nucleotides(utr5_sequence, max_length=-1, replace_T=True)
             utr3_sequence = _handle_special_nucleotides(utr3_sequence, max_length=-1, replace_T=True)
-            
-            # kmer_counts_from_text(utr5_sequence.replace("I", "A"), self.k_per_seq, batch_counts_utr5[batch_idx], mask=None)
-            # kmer_counts_from_text(utr3_sequence.replace("I", "A"), self.k_per_seq, batch_counts_utr3[batch_idx], mask=None)
-            # batch_counts_utr5[batch_idx] = batch_counts_utr5[batch_idx] + self.pseudo_kmer_alpha * len(utr5_sequence) * self.human_kmer_utr5
-            # batch_counts_utr3[batch_idx] = batch_counts_utr3[batch_idx] + self.pseudo_kmer_alpha * len(utr3_sequence) * self.human_kmer_utr3
-            # overall_counts_utr5 += batch_counts_utr5[batch_idx]
-            # overall_counts_utr3 += batch_counts_utr3[batch_idx]
-            
-            # batch_counts_utr5[batch_idx] = batch_counts_utr5[batch_idx] / batch_counts_utr5[batch_idx].sum()
-            # batch_counts_utr3[batch_idx] = batch_counts_utr3[batch_idx] / batch_counts_utr3[batch_idx].sum()
             
             if self.random_validation == "utr5":
                 utr5_sequence = generate_random_sequence(len(utr5_sequence))
@@ -429,7 +231,6 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             else:
                 raise ValueError(f"Unknown random validation type: {self.random_validation}")
 
-            labels.append(label)
             tokens[batch_idx, 0] = self.global_tokenizer.cls_idx
             special_token_mask[batch_idx, 0] = 1
             modality_type_tensors[batch_idx, 0] = self.modality_map["global_special_tokens"]
@@ -542,14 +343,6 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             species_idx = self.species_list.index(species)
             species_tensors[batch_idx] = species_idx
         
-        # process kmer counts
-        # overall_counts_utr5 = overall_counts_utr5 / overall_counts_utr5.sum()
-        # overall_counts_utr3 = overall_counts_utr3 / overall_counts_utr3.sum()
-        # overall_kmer_utr5 = torch.tensor(overall_counts_utr5, dtype=torch.float32)
-        # overall_kmer_utr3 = torch.tensor(overall_counts_utr3, dtype=torch.float32)
-        # batch_kmer_utr5 = torch.tensor(batch_counts_utr5, dtype=torch.float32)
-        # batch_kmer_utr3 = torch.tensor(batch_counts_utr3, dtype=torch.float32)
-        
         protein_input_ids = esm_tokenize(
                 all_protein_sequence, self.protein_tokenizer
             ).to(torch.int64)
@@ -592,7 +385,6 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
         # print statistics
         
         return {
-            "labels": labels,
             "protein_sequence": all_protein_sequence,
             "rna_input_ids": tokens,
             "protein_input_ids": protein_input_ids,
@@ -611,18 +403,15 @@ class SpeciesSpecificJointSequenceBatchConverter(object):
             "utr3_mask": utr3_mask,
             "cds_mask": cds_mask,
             "modality_mask": modality_mask,
-            "special_token_mask": special_token_mask
-            # "overall_kmer_utr5": overall_kmer_utr5,
-            # "overall_kmer_utr3": overall_kmer_utr3,
-            # "batch_kmer_utr5": batch_kmer_utr5,
-            # "batch_kmer_utr3": batch_kmer_utr3,
+            "special_token_mask": special_token_mask,
+            "proteinloc_label": loc_tensors
         }
+        
 
-
-class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
+class ProteinLocSpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
     def __init__(
             self, 
-            lmdb_path: str, 
+            proteinloc_data_path: str,
             metadata_path: str,
             training_key_list_file: Optional[str] = None,
             validation_key_list_file: Optional[str] = None,
@@ -638,11 +427,11 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
             random_validation=None
         ):
         super().__init__()
-        self.lmdb_path = lmdb_path
+        self.proteinloc_data_path = proteinloc_data_path
+        # self.validation_split = validation_split
         self.training_key_list_file = training_key_list_file
         self.validation_key_list_file = validation_key_list_file
         self.test_key_list_file = test_key_list_file
-        # self.validation_split = validation_split
         if batch_size is None and tokens_per_batch is None:
             raise ValueError("either batch_size or tokens_per_batch must be specified")
         elif tokens_per_batch is not None:
@@ -674,7 +463,7 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
         self.species_list = list(set(metadata.values()))
         self.species_list.append("Unknown")
         self.species_list.sort()
-        self.batch_converter = SpeciesSpecificJointSequenceBatchConverter(
+        self.batch_converter = ProteinLocSpeciesSpecificJointSequenceBatchConverter(
             global_alphabet=self.global_tokenizer,
             utr_alphabet=self.utr_alphabet,
             codon_alphabet=self.codon_alphabet, 
@@ -683,89 +472,36 @@ class SpeciesSpecificJointSequenceDataModule(pl.LightningDataModule):
             species_list=self.species_list
         )
 
-    def setup(self, stage: Optional[str] = None):      
-        if os.path.exists(self.training_key_list_file) and \
-            os.path.exists(self.validation_key_list_file) and \
-                not self.overwrite:
-            print(f"training_key_list_file {self.training_key_list_file} already exists, skip generating")
-            print(f"validation_key_list_file {self.validation_key_list_file} already exists, skip generating")
-            training_key_list = read_compressed_msgpack(self.training_key_list_file)
-            validation_key_list = read_compressed_msgpack(self.validation_key_list_file)
-        else:
-            raise ValueError("training_key_list_file and validation_key_list_file must be specified and exist")
-        if self.sequence_length_file is not None:
-            print("loading sequence length from file")
-            with open(self.sequence_length_file, "rb") as f:
-                sequence_length = msgpack.unpackb(
-                    zstd.ZstdDecompressor().decompress(f.read()), 
-                    raw=False)
-            print("sequence length loaded")
-        
-        # Assign train/val datasets for use in dataloaders
-        self.training_key_list = training_key_list
-        self.validation_key_list = validation_key_list
+    def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage == "validate" or stage is None:
-            self.training_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=training_key_list)
-            self.validation_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=validation_key_list)
-            if self.sequence_length_file is not None:
-                self.training_dataset.register_sequence_length(sequence_length)
-                self.validation_dataset.register_sequence_length(sequence_length)
+            # rnaloc dataset
+            self.training_dataset = ProteinLocJointSequenceDataset(self.proteinloc_data_path, self.metadata_path, mode='train')
+            self.validation_dataset = ProteinLocJointSequenceDataset(self.proteinloc_data_path, self.metadata_path, mode='val')
         
         if stage == "test":
-            test_key_list = read_compressed_msgpack(self.test_key_list_file)
-            self.test_dataset = SpeciesSpecificJointSequenceLMDBSequenceDataset(self.lmdb_path, self.metadata_path, keys=test_key_list)
-            if self.sequence_length_file is not None:
-                self.test_dataset.register_sequence_length(sequence_length)
-
+            self.test_dataset = ProteinLocJointSequenceDataset(self.proteinloc_data_path, self.metadata_path, mode='test')
+            
     def train_dataloader(self):
-        data_loader = self.get_dataloader(self.training_dataset)
-        if self.trainer is not None and self.trainer.model.module.resumed_dataloader_state_from_ckpt is not None:
-            print("Resuming dataloader state from checkpoint...")
-            data_loader.batch_sampler.load_state_dict(self.trainer.model.module.resumed_dataloader_state_from_ckpt)
-            self.trainer.model.module.resumed_dataloader_state_from_ckpt = None
-        return data_loader
+        rnaloc_data_loader = self.get_dataloader(self.training_dataset)
+        return rnaloc_data_loader
+        
 
     def val_dataloader(self):
-        return self.get_dataloader(self.validation_dataset)
+        rnaloc_data_loader = self.get_dataloader(self.validation_dataset)
+        return rnaloc_data_loader
     
     def get_dataloader(self, dataset):
-        if self.toks_per_batch is None:
-            distributed_bucket_sampler = DistributedSequenceBucketBatchSampler(
-                dataset, batch_size=self.batch_size,
-            )
+        
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            collate_fn=self.batch_converter,
+            pin_memory=True,
+            drop_last=True
+        )
 
-            if self.trainer is not None and self.trainer.current_epoch is not None:
-                distributed_bucket_sampler.set_epoch(self.trainer.current_epoch)
-            return DataLoaderWrapper(dataset, 
-                            shuffle=False, 
-                            collate_fn=self.batch_converter,
-                            num_workers=self.num_workers,
-                            batch_sampler=distributed_bucket_sampler,
-                            pin_memory=True,
-                            prefetch_factor=2
-                            # drop_last=True
-                    )
-        else:
-            if self.trainer is not None and self.trainer.overfit_batches > 0:
-                shuffle = False
-            else:
-                shuffle = True
-            distributed_bucket_sampler = DistributedSequenceBucketBatchSampler(
-                dataset, toks_per_batch=self.toks_per_batch, shuffle=shuffle
-            )
-
-            if self.trainer is not None and self.trainer.current_epoch is not None:
-                distributed_bucket_sampler.set_epoch(self.trainer.current_epoch)
-            return DataLoaderWrapper(dataset, 
-                            shuffle=False, 
-                            collate_fn=self.batch_converter,
-                            num_workers=self.num_workers,
-                            batch_sampler=distributed_bucket_sampler,
-                            pin_memory=True,
-                            prefetch_factor=2
-                            # drop_last=True
-                    )
-           
 
 def prepare_protein_inputs_for_model(
         protein_sequence,
@@ -877,10 +613,7 @@ def tokenize_inputs(
         utr5_sequence = _handle_special_nucleotides(utr5_sequence, max_length=-1, replace_T=True)
         # >>> 5' UTR Section <<<
         utr_5_tensor = torch.tensor(
-            [
-                utr_5_tokenizer.get_idx(utr5_sequence[i]) if utr5_sequence[i] != "_" else global_tokenizer.mask_idx \
-                    for i in range(0, len(utr5_sequence))    
-            ], dtype=torch.int64
+            [utr_5_tokenizer.get_idx(utr5_sequence[i]) for i in range(0, len(utr5_sequence))], dtype=torch.int64
         )
         tokens[
             0,
@@ -899,12 +632,10 @@ def tokenize_inputs(
         cds_sequence = _handle_special_nucleotides(cds_sequence, max_length=-1, replace_T=False)
         # >>> Codon Section <<<
         codon_list = [cds_sequence[i:i+3] for i in range(0, len(cds_sequence), 3)]
-        # protein_embeddings.shape[1] = protein_length + 2; then we need to consider the extra stop codon
-        if len(codon_list) != protein_embeddings.shape[1] - 1:
-            print(f"irregular cds sequences that don't match protein, {len(codon_list)}, {protein_embeddings.shape[1]}")
+        if len(codon_list) != len(protein_sequence) + 1:
+            print(f"irregular cds sequences that don't match protein, {len(codon_list)}, {len(protein_sequence)}")
         codon_tensor   = torch.tensor(
-            [codon_tokenizer.get_idx(codon_list[i]) if "_" not in codon_list[i] else global_tokenizer.mask_idx \
-                for i in range(0, len(codon_list))], dtype=torch.int64
+            [codon_tokenizer.get_idx(codon_list[i]) for i in range(0, len(codon_list))], dtype=torch.int64
         ) 
         tokens[
             0,
@@ -923,10 +654,7 @@ def tokenize_inputs(
         utr3_sequence = _handle_special_nucleotides(utr3_sequence, max_length=-1, replace_T=True)
         # >>> 3' UTR Section <<<
         utr_3_tensor = torch.tensor(
-            [
-                utr_3_tokenizer.get_idx(utr3_sequence[i]) if utr3_sequence[i] != "_" else global_tokenizer.mask_idx \
-                    for i in range(0, len(utr3_sequence))
-            ], dtype=torch.int64
+            [utr_3_tokenizer.get_idx(utr3_sequence[i]) for i in range(0, len(utr3_sequence))], dtype=torch.int64
         ) 
         tokens[
             0,
@@ -946,6 +674,5 @@ def tokenize_inputs(
         tokens[0, tokenized_length-1] = global_tokenizer.eos_idx
     tokens = tokens.long().to(protein_embeddings.device)
     return tokens, protein_embeddings
-
 
 

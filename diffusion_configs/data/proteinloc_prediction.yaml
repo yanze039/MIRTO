@@ -1,0 +1,10 @@
+name: protein_loc
+datamodule:
+  _target_: jsm.data.protein_loc.ProteinLocSpeciesSpecificJointSequenceDataModule
+  num_workers: 4
+  proteinloc_data_path: /home/yanze039/orcd/pool/RNA_design/data/predictors/protein_loc_category_cleaned.parquet
+  metadata_path: /home/yanze039/orcd/scratch/data/data/RefSeq/all_metadata.msgpack.zst
+  batch_size: 8
+  work_dir: /home/yanze039/orcd/scratch/data/data/RefSeq/training
+  overwrite: true
+  random_validation: null
